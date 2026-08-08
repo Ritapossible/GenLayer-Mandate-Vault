@@ -41,6 +41,24 @@ ESCALATE = "escalate"
 
 OUTCOMES = (APPROVED, DENIED, ESCALATE)
 
+# --- error classification -------------------------------------------------
+
+# Validators have to reach consensus on failures, not just on successes, so a
+# raised message carries a class prefix telling the validator how to compare it.
+#
+# The whole vocabulary is declared even though this contract only ever raises
+# `[EXPECTED]`. The prefixes are a protocol shared with validator code rather
+# than private strings: a validator that meets an `[EXTERNAL]` or `[TRANSIENT]`
+# message needs the comparison rule already defined, not inferred at the point
+# of failure. `[LLM_ERROR]` names the rule `validator_fn` already implements by
+# returning False on unusable leader output -- disagree, and force rotation.
+ERROR_EXPECTED = "[EXPECTED]"  # deterministic business logic -- must match exactly
+ERROR_EXTERNAL = "[EXTERNAL]"  # external 4xx, deterministic -- must match exactly
+ERROR_TRANSIENT = "[TRANSIENT]"  # network/5xx, non-deterministic -- both agree
+ERROR_LLM = "[LLM_ERROR]"  # model misbehavior -- always disagree, force rotation
+
+ERROR_PREFIXES = (ERROR_EXPECTED, ERROR_EXTERNAL, ERROR_TRANSIENT, ERROR_LLM)
+
 # Reason codes are part of the public surface: consumers branch on them and they
 # are written into stored history, so they are stable strings rather than
 # free-form prose.
@@ -67,6 +85,15 @@ REASONS = frozenset({
 })
 
 
+# Widest value the contract's `u256` storage fields can hold. Amounts and
+# timestamps arrive as unbounded Python ints -- calldata decodes integers at
+# arbitrary precision -- so the boundary that writes them to storage has to
+# check the range itself. Without that check an out-of-range value faults inside
+# `u256()`, which is an unclassified failure validators cannot compare, instead
+# of a classified rejection every node derives identically.
+U256_MAX = (1 << 256) - 1
+
+
 def normalize_address(text: str) -> str:
     """Canonical comparison form for an address.
 
@@ -77,6 +104,43 @@ def normalize_address(text: str) -> str:
     if not isinstance(text, str):
         return ""
     return text.strip().casefold()
+
+
+def error_class(message: object) -> str:
+    """The classification prefix on a raised message, or `""` if unprefixed.
+
+    Total by construction: a non-string, or a message from code that predates
+    the prefixes, classifies as `""` and is treated as unknown by
+    `errors_agree`. An unclassified failure must never read as agreement.
+    """
+    if not isinstance(message, str):
+        return ""
+    for prefix in ERROR_PREFIXES:
+        if message.startswith(prefix):
+            return prefix
+    return ""
+
+
+def errors_agree(leader_msg: object, validator_msg: object) -> bool:
+    """Whether two failed executions represent the same failure.
+
+    The comparison rule per class, following the runner's own semantics:
+
+    - `[EXPECTED]` / `[EXTERNAL]` are deterministic. Every honest node derives
+      the same message from the same state, so they must match exactly.
+    - `[TRANSIENT]` is not reproducible. Two nodes that both hit a transient
+      failure agree that the call failed, without agreeing on the text.
+    - `[LLM_ERROR]` and anything unclassified disagree, which forces rotation
+      rather than freezing an unexplained failure into consensus.
+    """
+    leader_class = error_class(leader_msg)
+    if leader_class != error_class(validator_msg):
+        return False
+    if leader_class in (ERROR_EXPECTED, ERROR_EXTERNAL):
+        return leader_msg == validator_msg
+    if leader_class == ERROR_TRANSIENT:
+        return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -343,18 +407,41 @@ def encode_verdict(verdict: dict) -> str:
 def verdicts_agree(mine: dict, theirs: dict, limits: Limits) -> bool:
     """Compare two verdicts field by field.
 
+    Total, like `canonicalize_verdict`, and for the same reason: `theirs` is the
+    leader's calldata, which is untrusted input. A leader that reports
+    `confidence` as a string would otherwise raise `TypeError` inside the
+    validator -- an unclassified fault, not a disagreement -- so a malformed
+    verdict has to resolve to False rather than escape.
+
     Confidence is compared only for approvals. On a denial the number changes
     nothing -- the spend is refused either way -- so comparing it would
     manufacture disagreement without buying any safety. Approvals are where the
     number gates the outcome, so that is where the tolerance applies.
     """
-    if mine["decision"] != theirs["decision"]:
+    if not isinstance(mine, dict) or not isinstance(theirs, dict):
         return False
-    if mine["decision"] == OUTSIDE:
+
+    decision = mine.get("decision")
+    if decision not in DECISIONS or decision != theirs.get("decision"):
+        return False
+    if decision == OUTSIDE:
         return True
-    if mine["clause_id"] != theirs["clause_id"]:
+
+    # An approval, so both sides must carry a well-formed clause id. `True`
+    # equals `1` in Python, so a bool is rejected before the comparison rather
+    # than allowed to pass as a citation of clause 1.
+    mine_id, their_id = mine.get("clause_id"), theirs.get("clause_id")
+    for value in (mine_id, their_id):
+        if isinstance(value, bool) or not isinstance(value, int):
+            return False
+    if mine_id != their_id:
         return False
-    return abs(mine["confidence"] - theirs["confidence"]) <= limits.confidence_tol
+
+    mine_conf, their_conf = mine.get("confidence"), theirs.get("confidence")
+    for value in (mine_conf, their_conf):
+        if isinstance(value, bool) or not isinstance(value, int):
+            return False
+    return abs(mine_conf - their_conf) <= limits.confidence_tol
 
 
 def settle(screen: Screen, verdict: dict) -> tuple[str, str, int | None, int]:

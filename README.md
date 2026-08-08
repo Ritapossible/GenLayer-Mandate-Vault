@@ -184,13 +184,23 @@ python build_contract.py
 `test_contract_sync.py` fails if the checked-in contract is stale, so drift
 cannot reach a reviewer or a deployment unnoticed. It also guards the failures
 that are invisible from the repo root and only show up on-chain: a surviving
-local import, non-ASCII bytes in the deploy path, duplicate top-level
-definitions, and a missing runner pin.
+local import, **a name the contract references but never imports**, non-ASCII
+bytes in the deploy path, duplicate top-level definitions, and a missing runner
+pin.
+
+That second guard exists because the inlining creates a specific trap.
+`build_contract.py` strips each library module's import prologue, and the
+contract carries one hand-written block covering the union. The test suite
+imports `mandate_core.py` and `mandate_prompts.py`, which still have their own
+imports -- so a name missing only from the contract passes every behavioral test
+and then raises `NameError` on-chain. The guard resolves every free name in the
+generated artifact against builtins, its own definitions, its imports, and the
+documented SDK exports.
 
 ## Testing
 
 ```bash
-python -m pytest -q              # 129 tests
+python -m pytest -q              # 172 tests
 python build_contract.py --check # fails if the artifact is stale
 genvm-lint check mandate_vault.py
 ```
@@ -213,9 +223,15 @@ been run, which means:
   output has not been observed
 
 The deterministic engine, the prompt builder, the coercion layer, and the
-artifact guards are all covered by the 129 passing tests. The nondet path is
+artifact guards are all covered by the 172 passing tests. The nondet path is
 covered by construction and reasoning only. That gap is the first thing to close
 on a machine with a working GenLayer test harness.
+
+That the environment cannot execute the contract is exactly why the artifact
+guards carry the weight they do. A missing import in the deployed file was live
+in this repo and invisible to every behavioral test, because the tests import
+the library modules rather than the artifact -- `test_contract_sync.py` now
+resolves the artifact's names statically instead.
 
 ## Design decisions
 
@@ -253,18 +269,38 @@ reversible by the owner, and a total `canonicalize_verdict` means there is no
 input for which the contract has no answer. The cost is that a genuinely
 transient model failure is recorded as a denial rather than retried.
 
+The validator path keeps one sharp edge by design: when the leader's *calldata*
+is malformed, the validator returns `False` to force rotation rather than
+ratifying the failure -- the leader is untrusted, and nothing it emits may be
+folded into consensus without being re-derived. `verdicts_agree` is total so
+that a malformed verdict resolves to that `False` instead of raising a
+`TypeError` inside the validator, which would be an unclassified fault no node
+could compare.
+
 **Addresses are parsed behind a user-error guard.** `Address()` raises on
 malformed input; unguarded, that surfaces as a runtime fault rather than a
 rejected transaction, which reads to a caller as "the contract is broken"
 instead of "that address is wrong".
 
+**Raised messages carry a classification prefix.** Validators have to reach
+consensus on failures, not only on successes, so every `gl.vm.UserError` is
+prefixed `[EXPECTED]` and `errors_agree` defines the comparison rule per class:
+`[EXPECTED]`/`[EXTERNAL]` must match exactly, `[TRANSIENT]` agrees without
+matching text, and `[LLM_ERROR]` or anything unclassified disagrees so the
+network rotates rather than freezing an unexplained failure into consensus. The
+full vocabulary is declared even though this contract only raises `[EXPECTED]`,
+because the prefixes are a protocol shared with validator code.
+
+The corollary is that no path may fail *un*classified. That is why `_now()`
+restates a parser `ValueError` as `[EXPECTED]` and range-checks the result, and
+why `request_spend` rejects an amount too wide for `u256`: calldata decodes
+integers at arbitrary precision, and a value that faulted inside `u256()` on the
+way to storage would be exactly the unclassified failure validators cannot
+compare.
+
 ## Known gaps
 
 - Validator agreement is unverified against a live runtime (see above).
-- Errors are raised as plain `gl.vm.UserError` without the
-  `[EXPECTED]`/`[EXTERNAL]`/`[TRANSIENT]`/`[LLM_ERROR]` classification prefixes
-  the GenLayer guidance describes. Every raise here is in fact an `[EXPECTED]`
-  caller error, so the prefixes would be uniform, but they are not present.
 - The pinned runner is one version behind the latest available.
 - History grows without bound. Reads are window-bounded, so this costs storage
   rather than per-request time, but there is no pruning.

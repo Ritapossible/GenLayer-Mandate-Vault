@@ -36,9 +36,15 @@ END = "# <<< END INLINE {name}"
 def library_body(path: pathlib.Path) -> str:
     """Return a module's source with its docstring and import prologue removed.
 
-    The imports are dropped because the generated contract hoists the union of
-    them into a single block; everything from the first real statement onward
-    is carried over verbatim, comments included.
+    The imports are dropped because the contract carries one hand-written
+    prologue covering the union of them; everything from the first real
+    statement onward is carried over verbatim, comments included.
+
+    That prologue is hand-maintained, not generated, so adding an import to a
+    library module and not to the contract is a real and silent failure mode:
+    the test suite imports the library modules, which still have their own
+    imports, so nothing local notices. `test_contract_sync.py` closes that hole
+    by resolving every free name in the generated artifact.
     """
     src = path.read_text(encoding="utf-8")
     lines = src.splitlines()

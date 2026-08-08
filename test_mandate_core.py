@@ -448,6 +448,56 @@ class TestVerdictAgreement:
         assert core.verdicts_agree(a, b, LIMITS)
 
 
+class TestVerdictAgreementIsTotal:
+    """`theirs` is the leader's calldata, which is untrusted input.
+
+    A malformed field has to resolve to a disagreement, never to an exception:
+    a `TypeError` raised inside `validator_fn` is an unclassified fault that no
+    validator can compare, whereas False is a clean vote to rotate.
+    """
+
+    APPROVAL = {"decision": "inside", "clause_id": 1, "confidence": 90}
+
+    @pytest.mark.parametrize(
+        "confidence", ["90", None, [], {}, 90.0, True, float("nan")]
+    )
+    def test_non_int_confidence_disagrees_without_raising(self, confidence):
+        theirs = {"decision": "inside", "clause_id": 1, "confidence": confidence}
+        assert not core.verdicts_agree(self.APPROVAL, theirs, LIMITS)
+
+    @pytest.mark.parametrize("clause_id", ["1", None, [], 1.0, True])
+    def test_non_int_clause_id_disagrees_without_raising(self, clause_id):
+        """`True` is rejected before the comparison: `True == 1` is true in
+        Python, so a bool would otherwise pass as a citation of clause 1."""
+        theirs = {"decision": "inside", "clause_id": clause_id, "confidence": 90}
+        assert not core.verdicts_agree(self.APPROVAL, theirs, LIMITS)
+
+    @pytest.mark.parametrize("missing", ["decision", "clause_id", "confidence"])
+    def test_absent_field_disagrees_without_raising(self, missing):
+        theirs = dict(self.APPROVAL)
+        del theirs[missing]
+        assert not core.verdicts_agree(self.APPROVAL, theirs, LIMITS)
+
+    @pytest.mark.parametrize("theirs", [None, "inside", 42, [], ("inside",)])
+    def test_non_dict_disagrees_without_raising(self, theirs):
+        assert not core.verdicts_agree(self.APPROVAL, theirs, LIMITS)
+
+    def test_unknown_decision_disagrees_even_when_both_sides_match(self):
+        """Two nodes echoing the same nonsense is not agreement on a verdict."""
+        junk = {"decision": "maybe", "clause_id": 1, "confidence": 90}
+        assert not core.verdicts_agree(junk, dict(junk), LIMITS)
+
+    def test_a_valid_approval_still_agrees(self):
+        """The hardening must not have broken the path it guards."""
+        assert core.verdicts_agree(self.APPROVAL, dict(self.APPROVAL), LIMITS)
+
+
+class TestStorageBounds:
+    def test_u256_max_is_the_real_bound(self):
+        assert core.U256_MAX == 2**256 - 1
+        assert core.U256_MAX.bit_length() == 256
+
+
 class TestSettle:
     def test_settled_approval_short_circuits(self):
         s = core.Screen(core.APPROVED, core.REASON_AUTO_ALLOWLIST)
@@ -672,3 +722,64 @@ class TestEndToEndCoercion:
         )
         assert outcome == core.DENIED
         assert reason == core.REASON_DENYLISTED
+
+
+class TestErrorClassification:
+    """Consensus on failure paths, not just on successes.
+
+    The property under test is asymmetric: agreement must be earned by a
+    matching classified message, while every unclassified or unexplained
+    failure must disagree so the runner rotates rather than freezing it in.
+    """
+
+    def test_prefix_is_recognised(self):
+        assert core.error_class(f"{core.ERROR_EXPECTED} owner only") == core.ERROR_EXPECTED
+        assert core.error_class(f"{core.ERROR_TRANSIENT} upstream down") == core.ERROR_TRANSIENT
+
+    @pytest.mark.parametrize("raw", ["", "owner only", None, 12, [], {}, True])
+    def test_unprefixed_classifies_as_unknown(self, raw):
+        """Total, like `canonicalize_verdict`: a non-string must not raise here."""
+        assert core.error_class(raw) == ""
+
+    def test_expected_requires_exact_match(self):
+        a = f"{core.ERROR_EXPECTED} clause too long"
+        assert core.errors_agree(a, a)
+        assert not core.errors_agree(a, f"{core.ERROR_EXPECTED} owner only")
+
+    def test_external_requires_exact_match(self):
+        a = f"{core.ERROR_EXTERNAL} API returned 404"
+        assert core.errors_agree(a, a)
+        assert not core.errors_agree(a, f"{core.ERROR_EXTERNAL} API returned 403")
+
+    def test_transient_agrees_without_matching_text(self):
+        """Two nodes agree the call failed without agreeing on the wording."""
+        assert core.errors_agree(
+            f"{core.ERROR_TRANSIENT} read timeout",
+            f"{core.ERROR_TRANSIENT} connection reset",
+        )
+
+    def test_llm_error_never_agrees(self):
+        """Identical text is still a disagreement -- rotation beats consensus on
+        a model that misbehaved."""
+        a = f"{core.ERROR_LLM} returned non-dict"
+        assert not core.errors_agree(a, a)
+
+    def test_classes_must_match(self):
+        assert not core.errors_agree(
+            f"{core.ERROR_EXPECTED} nope", f"{core.ERROR_TRANSIENT} nope"
+        )
+
+    @pytest.mark.parametrize("other", ["", "owner only", None, 0])
+    def test_unclassified_never_agrees(self, other):
+        assert not core.errors_agree(f"{core.ERROR_EXPECTED} owner only", other)
+        assert not core.errors_agree(other, other)
+
+    def test_every_prefix_is_in_the_tuple(self):
+        """Guards `error_class` against a prefix added to the vocabulary but not
+        to the tuple it scans, which would silently classify as unknown."""
+        assert set(core.ERROR_PREFIXES) == {
+            core.ERROR_EXPECTED,
+            core.ERROR_EXTERNAL,
+            core.ERROR_TRANSIENT,
+            core.ERROR_LLM,
+        }
