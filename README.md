@@ -159,9 +159,12 @@ Stable strings, written into stored history and safe to branch on:
 
 ## Layout
 
-GenLayer deploys a **single file**: `genlayer deploy --contract` reads one path
-and performs no module bundling, so a local `import mandate_core` has nothing to
-resolve against on-chain.
+This contract pins the **`py-genlayer`** runner, which loads one module, and
+`genlayer deploy --contract` reads a single path and performs no bundling -- so a
+local `import mandate_core` has nothing to resolve against on-chain. GenLayer
+does offer a `py-genlayer-multi` runner for contracts packaged across several
+files; this project keeps the single-module runner and inlines instead, so the
+deployed bytes stay one reviewable artifact.
 
 | file | role |
 |---|---|
