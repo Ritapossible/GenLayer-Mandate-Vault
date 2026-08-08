@@ -1,0 +1,7 @@
+# The deployable artifact and its sources must stay byte-stable across platforms.
+# build_contract.py --check compares regenerated content against the checked-in
+# file, so a CRLF checkout would report a false "stale artifact".
+*.py text eol=lf
+*.md text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
