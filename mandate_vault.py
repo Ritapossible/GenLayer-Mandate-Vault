@@ -465,17 +465,24 @@ def verdicts_agree(mine: dict, theirs: dict, limits: Limits) -> bool:
     # An approval, so both sides must carry a well-formed clause id. `True`
     # equals `1` in Python, so a bool is rejected before the comparison rather
     # than allowed to pass as a citation of clause 1.
+    #
+    # Each name is guarded on its own line rather than in a loop over the pair.
+    # A loop is correct at runtime but a type checker cannot narrow the
+    # originals through it, so it reads the arithmetic below as `None - None`
+    # and `genvm-lint typecheck` fails on a guard that in fact holds.
     mine_id, their_id = mine.get("clause_id"), theirs.get("clause_id")
-    for value in (mine_id, their_id):
-        if isinstance(value, bool) or not isinstance(value, int):
-            return False
+    if isinstance(mine_id, bool) or not isinstance(mine_id, int):
+        return False
+    if isinstance(their_id, bool) or not isinstance(their_id, int):
+        return False
     if mine_id != their_id:
         return False
 
     mine_conf, their_conf = mine.get("confidence"), theirs.get("confidence")
-    for value in (mine_conf, their_conf):
-        if isinstance(value, bool) or not isinstance(value, int):
-            return False
+    if isinstance(mine_conf, bool) or not isinstance(mine_conf, int):
+        return False
+    if isinstance(their_conf, bool) or not isinstance(their_conf, int):
+        return False
     return abs(mine_conf - their_conf) <= limits.confidence_tol
 
 
@@ -645,6 +652,63 @@ def _parse_address(raw: str, field: str) -> Address:
         raise gl.vm.UserError(f"{ERROR_EXPECTED} {field} is not a valid address") from None
 
 
+# A parameter annotation is documentation, not enforcement. The runner resolves
+# the method and calls it with the decoded calldata as-is --
+# `meth2call(contract_instance, *cd["args"], **cd["kwargs"])` -- and neither
+# `@gl.public.write` nor `@gl.public.view` wraps the function; both only set
+# attributes on it. So an `amount: int` parameter genuinely arrives as whatever
+# the caller encoded, and calldata decodes to
+# `None | int | str | bytes | list | dict`.
+#
+# Every such value has to be refused at the boundary, before any arithmetic
+# touches it. `int("abc")` raises `ValueError` and `None < 0` raises
+# `TypeError`, and either escapes as an unclassified VM error -- the one thing
+# the error-class protocol exists to prevent, because validators have no rule
+# for comparing a failure that carries no prefix.
+
+
+def _require_int(raw: object, field: str) -> int:
+    """Coerce a calldata field to a real int, failing as a classified error.
+
+    A bool is refused rather than widened, for the reason it is refused
+    throughout the verdict layer: `True == 1` in Python, so accepting one would
+    let `request_spend(payee, True, memo)` read as a one-base-unit spend.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise gl.vm.UserError(f"{ERROR_EXPECTED} {field} must be an integer")
+    return raw
+
+
+def _require_u256(raw: object, field: str) -> int:
+    """Coerce a calldata field to an int a `u256` slot can actually hold.
+
+    Only the upper bound is checked. Every caller either feeds the result to
+    `Limits.validate()`, which names the specific bound a negative missed, or --
+    in `request_spend`'s case -- wants a negative amount recorded as a denial
+    rather than raised. Rejecting negatives here would take both of those away
+    and replace them with a worse message.
+    """
+    value = _require_int(raw, field)
+    if value > U256_MAX:
+        raise gl.vm.UserError(f"{ERROR_EXPECTED} {field} exceeds u256 range")
+    return value
+
+
+def _require_bool(raw: object, field: str) -> bool:
+    """Coerce a calldata field to a real bool, failing as a classified error.
+
+    Stricter than truthiness on purpose, and this one is an authorization bug
+    rather than a crash. `BoolDesc.set` writes `1 if val else 0`, so it accepts
+    any object and reads its truthiness -- and every non-empty string is truthy.
+    Without this guard `set_agent(addr, "false")` would *grant* that address
+    spending authority, and `set_denylist(payee, "")` would silently unblock a
+    payee the owner meant to block.
+    """
+    if not isinstance(raw, bool):
+        raise gl.vm.UserError(f"{ERROR_EXPECTED} {field} must be a boolean")
+    return raw
+
+
 @allow_storage
 @dataclass
 class Spend:
@@ -697,6 +761,20 @@ class MandateVault(gl.Contract):
         # misconfigured deploy fails at construction instead of at first spend.
         # `validate()` speaks ValueError because it is runtime-independent; the
         # contract boundary restates it as a classified error.
+        #
+        # The type and range checks come first because `validate()` cannot do
+        # them: it compares (`per_tx_cap < 1`), and comparing a str to an int
+        # raises `TypeError`, which is not what the `except` below catches. The
+        # upper bound is checked for the same reason the fields are written as
+        # `u256` -- `validate()` has no opinion about width, so a cap of `2**300`
+        # would clear it and then fault inside `u256()` further down.
+        per_tx_cap = _require_u256(per_tx_cap, "per_tx_cap")
+        period_cap = _require_u256(period_cap, "period_cap")
+        period_seconds = _require_u256(period_seconds, "period_seconds")
+        auto_approve_under = _require_u256(auto_approve_under, "auto_approve_under")
+        min_confidence = _require_u256(min_confidence, "min_confidence")
+        confidence_tol = _require_u256(confidence_tol, "confidence_tol")
+
         try:
             Limits(
                 per_tx_cap=per_tx_cap,
@@ -835,6 +913,7 @@ class MandateVault(gl.Contract):
 
     @gl.public.view
     def get_spend(self, spend_id: int) -> dict:
+        spend_id = _require_int(spend_id, "spend_id")
         if spend_id < 0 or spend_id >= len(self.spends):
             raise gl.vm.UserError(f"{ERROR_EXPECTED} no such spend")
         s = self.spends[spend_id]
@@ -860,6 +939,11 @@ class MandateVault(gl.Contract):
         that needs a model -- so an ESCALATE outcome means "the numbers are fine,
         the purpose still has to hold up".
         """
+        # Guarded exactly as the write path guards it, so a simulation answers
+        # the question the caller is actually about to ask. A view that accepted
+        # `"500"` while `request_spend("...", "500", ...)` refused it would be
+        # worse than no simulation at all.
+        amount = _require_u256(amount, "amount")
         payee_addr = _parse_address(payee, "payee")
         screen = screen_request(
             amount=amount,
@@ -899,6 +983,7 @@ class MandateVault(gl.Contract):
     def revoke_clause(self, clause_id: int) -> None:
         """Narrow the mandate. Ids are never reused, so audit trails survive."""
         self._require_owner()
+        clause_id = _require_int(clause_id, "clause_id")
         if clause_id < 0 or clause_id >= len(self.clauses):
             raise gl.vm.UserError(f"{ERROR_EXPECTED} no such clause")
         self.revoked[clause_id] = True
@@ -906,16 +991,19 @@ class MandateVault(gl.Contract):
     @gl.public.write
     def set_agent(self, agent: str, allowed: bool) -> None:
         self._require_owner()
+        allowed = _require_bool(allowed, "allowed")
         self.agents[normalize_address(_parse_address(agent, "agent").as_hex)] = allowed
 
     @gl.public.write
     def set_allowlist(self, payee: str, allowed: bool) -> None:
         self._require_owner()
+        allowed = _require_bool(allowed, "allowed")
         self.allowlist[normalize_address(_parse_address(payee, "payee").as_hex)] = allowed
 
     @gl.public.write
     def set_denylist(self, payee: str, blocked: bool) -> None:
         self._require_owner()
+        blocked = _require_bool(blocked, "blocked")
         self.denylist[normalize_address(_parse_address(payee, "payee").as_hex)] = blocked
 
     # --- write path ---
@@ -942,8 +1030,13 @@ class MandateVault(gl.Contract):
         # the audit record stays truthful. An amount too wide to store is
         # rejected here rather than left to fault inside `u256()`, where it
         # would surface as an unclassified error instead of a comparable one.
-        if isinstance(amount, int) and not isinstance(amount, bool) and amount > U256_MAX:
-            raise gl.vm.UserError(f"{ERROR_EXPECTED} amount exceeds u256 range")
+        #
+        # A negative or zero amount deliberately survives this guard: it is
+        # representable, so it is recorded as a denial reasoned
+        # `amount_not_positive` rather than raised. That distinction -- refuse
+        # what cannot be represented, record what can -- is the line the whole
+        # boundary is drawn on.
+        amount = _require_u256(amount, "amount")
         payee_addr = _parse_address(payee, "payee")
 
         active = self._active_clauses()
@@ -958,9 +1051,9 @@ class MandateVault(gl.Contract):
 
         verdict = dict(DENY_VERDICT)
         if not screen.is_settled():
-            verdict = self._clause_verdict(payee_addr, int(amount), memo, active)
+            verdict = self._clause_verdict(payee_addr, amount, memo, active)
 
-        return self._commit(payee_addr, int(amount), memo, screen, verdict)
+        return self._commit(payee_addr, amount, memo, screen, verdict)
 
     def _clause_verdict(
         self,

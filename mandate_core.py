@@ -430,17 +430,24 @@ def verdicts_agree(mine: dict, theirs: dict, limits: Limits) -> bool:
     # An approval, so both sides must carry a well-formed clause id. `True`
     # equals `1` in Python, so a bool is rejected before the comparison rather
     # than allowed to pass as a citation of clause 1.
+    #
+    # Each name is guarded on its own line rather than in a loop over the pair.
+    # A loop is correct at runtime but a type checker cannot narrow the
+    # originals through it, so it reads the arithmetic below as `None - None`
+    # and `genvm-lint typecheck` fails on a guard that in fact holds.
     mine_id, their_id = mine.get("clause_id"), theirs.get("clause_id")
-    for value in (mine_id, their_id):
-        if isinstance(value, bool) or not isinstance(value, int):
-            return False
+    if isinstance(mine_id, bool) or not isinstance(mine_id, int):
+        return False
+    if isinstance(their_id, bool) or not isinstance(their_id, int):
+        return False
     if mine_id != their_id:
         return False
 
     mine_conf, their_conf = mine.get("confidence"), theirs.get("confidence")
-    for value in (mine_conf, their_conf):
-        if isinstance(value, bool) or not isinstance(value, int):
-            return False
+    if isinstance(mine_conf, bool) or not isinstance(mine_conf, int):
+        return False
+    if isinstance(their_conf, bool) or not isinstance(their_conf, int):
+        return False
     return abs(mine_conf - their_conf) <= limits.confidence_tol
 
 
