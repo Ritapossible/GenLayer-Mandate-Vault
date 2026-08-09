@@ -362,7 +362,6 @@ so this file is the only place it can be checked at all.
 ## Known gaps
 
 - Validator agreement is unverified against a live runtime (see above).
-- The pinned runner is one version behind the latest available.
 - History grows without bound. Reads are window-bounded, so this costs storage
   rather than per-request time, but there is no pruning.
 
