@@ -38,9 +38,14 @@ import sysconfig
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CONTRACT = "contracts/mandate_vault.py"
 
-# Directories that hold no reviewable source.
+# Directory names that hold no reviewable source. A repo-local virtualenv is the
+# one that matters: `pip install -r requirements.txt` into `.venv/` drops
+# thousands of third-party files, some of which do not parse as current Python.
+# Walking into it would be slow here and would raise `SyntaxError` in the layout
+# guard that imports this set.
 SKIP = {".git", "__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache",
-        ".venv", "venv", "env", "node_modules"}
+        ".venv", "venv", "env", ".env", "node_modules", "site-packages",
+        "build", "dist", ".tox", ".eggs"}
 
 
 def find_linter() -> str:
@@ -128,7 +133,21 @@ def main() -> int:
     if passing != [CONTRACT]:
         extra = [f for f in passing if f != CONTRACT]
         if CONTRACT not in passing:
-            problems.append(f"{CONTRACT} does not pass genvm-lint check")
+            # An SDK that will not load is an environment problem, not a verdict
+            # on the contract. On a cold cache the first check downloads the SDK
+            # for the pinned runner, and reporting a failed download as "the
+            # contract does not validate" would send a reviewer to debug code
+            # that is fine.
+            row = next(r for r in results if r["file"] == CONTRACT)
+            if any("Failed to load SDK" in e for e in row.get("errors") or []):
+                problems.append(
+                    f"could not validate {CONTRACT}: the GenVM SDK for the pinned "
+                    "runner failed to load. This is an environment or network "
+                    "problem, not a contract error -- check connectivity and retry, "
+                    "or pre-fetch with `genvm-lint download`."
+                )
+            else:
+                problems.append(f"{CONTRACT} does not pass genvm-lint check")
         if extra:
             problems.append(
                 f"files outside the contract path also validate as contracts: {extra}"

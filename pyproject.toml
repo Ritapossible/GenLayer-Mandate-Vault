@@ -2,5 +2,8 @@
 # The library modules live in `src/`, not at the repo root, so that `contracts/`
 # is the only directory holding a deployable contract. Tests import them by bare
 # module name (`import mandate_core`), which needs `src/` on the path.
-pythonpath = ["src"]
+# `tools` is here so the layout guard in test_contract_sync.py can import the
+# directory-skip set from verify_submission.py rather than keeping a second copy
+# of it in sync by hand.
+pythonpath = ["src", "tools"]
 testpaths = ["tests"]

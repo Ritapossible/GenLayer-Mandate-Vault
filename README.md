@@ -252,7 +252,17 @@ repository and asserts the shape of the whole result -- exactly one file
 validates as a contract, and it is `contracts/mandate_vault.py`. It exits
 non-zero otherwise, including if a helper module ever starts passing.
 
-Recorded output, `genvm-linter==0.11.0`:
+The contract's own report, `genvm-lint check contracts/mandate_vault.py --json`:
+
+```json
+{"ok":true,"lint":{"ok":true,"passed":3},"validate":{"ok":true,
+ "contract":"MandateVault","methods":13,"view_methods":7,"write_methods":6,
+ "ctor_params":7}}
+```
+
+That is the submitted contract, and it validates. The sweep below is the
+corroborating half -- it shows that nothing else in the repository is a second
+candidate. Recorded with `genvm-linter==0.11.0`:
 
 ```
 GenVM validation sweep - 7 Python files
@@ -276,20 +286,19 @@ OK: exactly one contract source in this repository - contracts/mandate_vault.py
 Every other Python file is development tooling and is never deployed.
 ```
 
-The contract's own report, `genvm-lint check contracts/mandate_vault.py --json`:
+**The per-file message on the six tooling rows is environment-dependent, and the
+assertion is not on that text.** Pointing a *contract* validator at a file that
+is not a contract is an error by construction; which error depends on how far
+the validator gets. With no SDK resolved for those files -- they carry no
+`Depends` header -- it reports `E101: Failed to load SDK`, as above. On a machine
+with an SDK already cached it gets one step further and reports `E105: no
+contract class found`. Both mean the same thing, and neither is a defect in
+those files: they are build tooling and tests, they were never contracts, and
+they are not part of the submitted contract source set.
 
-```json
-{"ok":true,"lint":{"ok":true,"passed":3},"validate":{"ok":true,
- "contract":"MandateVault","methods":13,"view_methods":7,"write_methods":6,
- "ctor_params":7}}
-```
-
-The errors listed against the six tooling files are the expected and correct
-result of pointing a *contract* validator at a file that is not a contract --
-they carry no `Depends` header, so the linter cannot resolve an SDK to validate
-against, and reports that rather than a missing contract class. Those files are
-not part of the contract source set; they are listed here only to show that the
-sweep covered them and that none of them is a second candidate.
+What `verify_submission.py` asserts is the *shape* of the sweep -- exactly one
+`PASS`, and it is `contracts/mandate_vault.py` -- so it holds either way. It
+exits non-zero if the vault stops validating or if anything else starts.
 
 `genvm-lint typecheck` runs Pyright against the SDK the linter downloads for the
 pinned runner, so it resolves `gl.*` for real rather than treating it as `Any`.

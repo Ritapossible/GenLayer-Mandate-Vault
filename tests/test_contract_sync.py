@@ -58,10 +58,17 @@ def test_only_the_contract_declares_a_gl_contract():
     `gl.Contract` subclass sitting in `src/` or `tools/` would make a scanner
     reasonably conclude the repo ships two contracts.
     """
+    # Same skip set the submission sweep uses, imported rather than restated so
+    # the two cannot drift. It matters most for a repo-local `.venv/`: without
+    # it this walks site-packages and `ast.parse` raises on the first vendored
+    # file that is not valid current-Python, turning a layout guard into a
+    # spurious error on a reviewer's fresh clone.
+    from verify_submission import SKIP
+
     offenders: list[str] = []
     for path in ROOT.rglob("*.py"):
         rel = path.relative_to(ROOT)
-        if rel.parts[0] in {".git", "contracts"} or "__pycache__" in rel.parts:
+        if SKIP & set(rel.parts) or rel.parts[0] == "contracts":
             continue
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
             if not isinstance(node, ast.ClassDef):
