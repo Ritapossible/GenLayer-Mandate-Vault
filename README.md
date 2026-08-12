@@ -22,6 +22,27 @@ request that passes every limit and still needs a judgment about purpose reaches
 a model, so nondet cost is at most **one LLM call per spend** regardless of how
 elaborate the mandate is.
 
+## Contract source
+
+**The intelligent contract is `contracts/mandate_vault.py`, and it is the only
+one.** `contracts/` holds that single file and nothing else.
+
+Every other Python file in this repository is development tooling -- the library
+modules the contract is generated from, the generator, and the tests. None of
+them declares a `gl.Contract`, none is deployable, and none is submitted as a
+contract:
+
+| path | contains a contract? |
+|---|---|
+| `contracts/mandate_vault.py` | **yes** -- `class MandateVault(gl.Contract)`, 13 public methods |
+| `src/`, `tools/`, `tests/` | no -- helper modules, build tooling, test suite |
+
+Two tests in `tests/test_contract_sync.py` hold that line: one fails if any file
+other than the vault appears under `contracts/`, the other fails if a
+`gl.Contract` subclass appears anywhere outside it. Run
+`python tools/verify_submission.py` to reproduce the validation sweep -- see
+[Validation evidence](#validation-evidence).
+
 ## Why this needs GenLayer
 
 The mandate is prose, so enforcing it requires natural-language judgment. The
@@ -89,7 +110,7 @@ is the durable property, not preventing agreement.
 ## Deploying
 
 ```bash
-genlayer deploy --contract mandate_vault.py --args \
+genlayer deploy --contract contracts/mandate_vault.py --args \
   '["Cloud compute and GPU rental for model training or inference.","Purchase or licensing of datasets used for training."]' \
   500000000 2000000000 604800 10000000 75 20
 ```
@@ -166,22 +187,30 @@ does offer a `py-genlayer-multi` runner for contracts packaged across several
 files; this project keeps the single-module runner and inlines instead, so the
 deployed bytes stay one reviewable artifact.
 
-| file | role |
+| path | role |
 |---|---|
-| `mandate_vault.py` | **the deployable artifact.** Contract code, plus the two libraries inlined between `INLINE` markers. |
-| `mandate_core.py` | deterministic engine -- caps, window, screening, coercion. Source of truth. |
-| `mandate_prompts.py` | prompt construction. The trust boundary. Source of truth. |
-| `build_contract.py` | splices the libraries into the marked regions |
-| `test_mandate_core.py` | behavior |
-| `test_contract_sync.py` | guards on the artifact itself |
+| `contracts/mandate_vault.py` | **the deployable artifact, and the only contract.** Contract code, plus the two libraries inlined between `INLINE` markers. |
+| `src/mandate_core.py` | deterministic engine -- caps, window, screening, coercion. Source of truth. |
+| `src/mandate_prompts.py` | prompt construction. The trust boundary. Source of truth. |
+| `tools/build_contract.py` | splices the libraries into the marked regions |
+| `tools/verify_submission.py` | lints every `.py` and asserts only the vault is a contract |
+| `tests/test_mandate_core.py` | behavior |
+| `tests/test_contract_sync.py` | guards on the artifact itself, and on the layout |
+
+The split between `contracts/` and everything else is load-bearing, not
+cosmetic. A validator enumerating this repository finds exactly one candidate,
+so it never lints a helper module and reports "no contract class found" against
+a file that was never meant to declare one. The library modules stay out of
+`contracts/` for that reason alone -- they are the contract's *sources*, not
+contracts.
 
 Edit the library modules, never the marked regions. Then:
 
 ```bash
-python build_contract.py
+python tools/build_contract.py
 ```
 
-`test_contract_sync.py` fails if the checked-in contract is stale, so drift
+`tests/test_contract_sync.py` fails if the checked-in contract is stale, so drift
 cannot reach a reviewer or a deployment unnoticed. It also guards the failures
 that are invisible from the repo root and only show up on-chain: a surviving
 local import, **a name the contract references but never imports**, non-ASCII
@@ -189,7 +218,7 @@ bytes in the deploy path, duplicate top-level definitions, and a missing runner
 pin.
 
 That second guard exists because the inlining creates a specific trap.
-`build_contract.py` strips each library module's import prologue, and the
+`tools/build_contract.py` strips each library module's import prologue, and the
 contract carries one hand-written block covering the union. The test suite
 imports `mandate_core.py` and `mandate_prompts.py`, which still have their own
 imports -- so a name missing only from the contract passes every behavioral test
@@ -200,16 +229,67 @@ documented SDK exports.
 ## Testing
 
 ```bash
-python -m pytest -q                        # 174 tests
-python build_contract.py --check           # fails if the artifact is stale
-genvm-lint check mandate_vault.py
-genvm-lint typecheck mandate_vault.py --all
+pip install -r requirements.txt
+
+python -m pytest -q                             # 176 tests
+python tools/build_contract.py --check          # fails if the artifact is stale
+python tools/verify_submission.py               # lints every .py in the repo
+genvm-lint check contracts/mandate_vault.py
+genvm-lint typecheck contracts/mandate_vault.py --all
 ```
 
 `genvm-lint check` passes: 3 lint checks, validation ok, 13 methods (7 view, 6
 write), 7 constructor params. It reports one informational notice (`I200`) that a
 newer runner is available than the pinned one; the pin is intentional and the
 runner is upgraded deliberately, not on notice.
+
+### Validation evidence
+
+`genvm-lint check` on the contract alone would not answer the question a reviewer
+actually asks, which is whether the *source set* is unambiguous. So
+`tools/verify_submission.py` runs the validator over every `.py` file in the
+repository and asserts the shape of the whole result -- exactly one file
+validates as a contract, and it is `contracts/mandate_vault.py`. It exits
+non-zero otherwise, including if a helper module ever starts passing.
+
+Recorded output, `genvm-linter==0.11.0`:
+
+```
+GenVM validation sweep - 7 Python files
+
+  PASS  contracts/mandate_vault.py
+        contract=MandateVault  methods=13
+  n/a   src/mandate_core.py
+        not a contract (E101: Failed to load SDK: No module named 'genlayer.py')
+  n/a   src/mandate_prompts.py
+        not a contract (E101: Failed to load SDK: No module named 'genlayer.py')
+  n/a   tests/test_contract_sync.py
+        not a contract (E101: Failed to load SDK: No module named 'genlayer.py')
+  n/a   tests/test_mandate_core.py
+        not a contract (E101: Failed to load SDK: No module named 'genlayer.py')
+  n/a   tools/build_contract.py
+        not a contract (E101: Failed to load SDK: No module named 'genlayer.py')
+  n/a   tools/verify_submission.py
+        not a contract (E101: Failed to load SDK: No module named 'genlayer.py')
+
+OK: exactly one contract source in this repository - contracts/mandate_vault.py
+Every other Python file is development tooling and is never deployed.
+```
+
+The contract's own report, `genvm-lint check contracts/mandate_vault.py --json`:
+
+```json
+{"ok":true,"lint":{"ok":true,"passed":3},"validate":{"ok":true,
+ "contract":"MandateVault","methods":13,"view_methods":7,"write_methods":6,
+ "ctor_params":7}}
+```
+
+The errors listed against the six tooling files are the expected and correct
+result of pointing a *contract* validator at a file that is not a contract --
+they carry no `Depends` header, so the linter cannot resolve an SDK to validate
+against, and reports that rather than a missing contract class. Those files are
+not part of the contract source set; they are listed here only to show that the
+sweep covered them and that none of them is a second candidate.
 
 `genvm-lint typecheck` runs Pyright against the SDK the linter downloads for the
 pinned runner, so it resolves `gl.*` for real rather than treating it as `Any`.
@@ -244,7 +324,7 @@ documented as the stack of *view* method calls -- so views travel through the
 same message as writes. There is no path that omits it.
 
 The deterministic engine, the prompt builder, the coercion layer, and the
-artifact guards are all covered by the 174 passing tests. The nondet path is
+artifact guards are all covered by the 176 passing tests. The nondet path is
 covered by construction and reasoning only. That gap is the first thing to close
 on a machine with a working GenLayer test harness.
 

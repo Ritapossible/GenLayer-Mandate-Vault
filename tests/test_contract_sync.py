@@ -1,8 +1,10 @@
 """Guards on the deployable artifact.
 
 These do not test behavior -- `test_mandate_core.py` does that. They test the
-properties that make `mandate_vault.py` deployable at all, each one standing in
-for a failure that is invisible from the repo root and only shows up on-chain.
+properties that make `contracts/mandate_vault.py` deployable at all, each one
+standing in for a failure that is invisible from the repo root and only shows up
+on-chain -- or, in the case of `test_contracts_dir_holds_exactly_one_contract`,
+one that shows up in a reviewer's validation report.
 """
 
 from __future__ import annotations
@@ -13,13 +15,62 @@ import pathlib
 import subprocess
 import sys
 
-ROOT = pathlib.Path(__file__).resolve().parent
-CONTRACT = ROOT / "mandate_vault.py"
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CONTRACT = ROOT / "contracts" / "mandate_vault.py"
+SRC = ROOT / "src"
+BUILDER = ROOT / "tools" / "build_contract.py"
 LIBRARIES = ("mandate_core", "mandate_prompts")
 
 
 def _source() -> str:
     return CONTRACT.read_text(encoding="utf-8")
+
+
+def test_contracts_dir_holds_exactly_one_contract():
+    """`contracts/` contains one file and it is the vault.
+
+    A validator pointed at this repo enumerates contract candidates by path. Any
+    second `.py` under `contracts/` -- a helper, an `__init__.py`, a scratch copy
+    -- becomes a candidate too, and since it declares no `gl.Contract` subclass
+    the validation report carries an error against a file that was never meant to
+    be a contract. The source set then reads as "not lint-clean" even though the
+    deployable artifact is fine.
+
+    That is a packaging failure, not a code failure, which is exactly why it
+    needs a test: nothing about the contract's own correctness would catch it.
+    """
+    contracts_dir = ROOT / "contracts"
+    found = sorted(p.name for p in contracts_dir.glob("*.py"))
+    assert found == ["mandate_vault.py"], (
+        f"contracts/ must hold exactly one file, the contract itself; found {found}. "
+        "Helper modules belong in src/, build tooling in tools/, tests in tests/."
+    )
+    assert not [p for p in contracts_dir.rglob("*.py") if p.parent != contracts_dir], (
+        "contracts/ must have no subdirectories containing Python files"
+    )
+
+
+def test_only_the_contract_declares_a_gl_contract():
+    """No module outside `contracts/` subclasses `gl.Contract`.
+
+    The mirror of the test above: that one keeps stray files out of the contract
+    directory, this one keeps stray contract classes out of everywhere else. A
+    `gl.Contract` subclass sitting in `src/` or `tools/` would make a scanner
+    reasonably conclude the repo ships two contracts.
+    """
+    offenders: list[str] = []
+    for path in ROOT.rglob("*.py"):
+        rel = path.relative_to(ROOT)
+        if rel.parts[0] in {".git", "contracts"} or "__pycache__" in rel.parts:
+            continue
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for base in node.bases:
+                # `gl.Contract` -> Attribute(value=Name('gl'), attr='Contract')
+                if isinstance(base, ast.Attribute) and base.attr == "Contract":
+                    offenders.append(f"{rel.as_posix()}:{node.name}")
+    assert not offenders, f"gl.Contract subclasses outside contracts/: {offenders}"
 
 
 def test_contract_is_in_sync_with_libraries():
@@ -29,7 +80,7 @@ def test_contract_is_in_sync_with_libraries():
     contract whose logic silently lags its own tests.
     """
     result = subprocess.run(
-        [sys.executable, "build_contract.py", "--check"],
+        [sys.executable, str(BUILDER), "--check"],
         cwd=ROOT,
         capture_output=True,
         text=True,
@@ -154,7 +205,7 @@ def test_contract_prologue_covers_library_imports():
     }
 
     for name in LIBRARIES:
-        tree = ast.parse((ROOT / f"{name}.py").read_text(encoding="utf-8"))
+        tree = ast.parse((SRC / f"{name}.py").read_text(encoding="utf-8"))
         for node in tree.body:
             if isinstance(node, ast.Import):
                 for a in node.names:

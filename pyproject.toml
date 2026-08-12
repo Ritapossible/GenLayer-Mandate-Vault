@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+# The library modules live in `src/`, not at the repo root, so that `contracts/`
+# is the only directory holding a deployable contract. Tests import them by bare
+# module name (`import mandate_core`), which needs `src/` on the path.
+pythonpath = ["src"]
+testpaths = ["tests"]

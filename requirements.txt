@@ -1,0 +1,11 @@
+# Development and verification tooling. None of this is deployed -- the only
+# thing that reaches the chain is `contracts/mandate_vault.py`, and the GenVM
+# runner it targets is pinned in that file's `Depends` header.
+
+# The official GenLayer contract validator. `genvm-lint check` is what a
+# reviewer runs; pinned so the recorded report in README.md is reproducible.
+genvm-linter==0.11.0
+
+# Test suite: behavior (`tests/test_mandate_core.py`) plus the artifact guards
+# (`tests/test_contract_sync.py`).
+pytest>=8.0

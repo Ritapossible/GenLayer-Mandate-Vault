@@ -44,12 +44,17 @@ Note this is defense-in-depth, not a substitute for greyboxing: an injection
 every validator's model obeys would reach consensus. Bounding the blast radius
 is the durable property, not preventing agreement.
 
-Layout. GenLayer deploys a single file, so the deterministic engine
-(`mandate_core.py`) and the prompt builder (`mandate_prompts.py`) are inlined
-below between INLINE markers rather than imported. Those two modules remain the
-source of truth and are what the test suite exercises; `build_contract.py`
-regenerates the marked regions and `test_contract_sync.py` fails if this file
-falls behind them.
+Layout. This file is the whole contract and the only one in `contracts/`.
+GenLayer deploys a single file, so the deterministic engine
+(`src/mandate_core.py`) and the prompt builder (`src/mandate_prompts.py`) are
+inlined below between INLINE markers rather than imported. Those two modules
+remain the source of truth and are what the test suite exercises;
+`tools/build_contract.py` regenerates the marked regions and
+`tests/test_contract_sync.py` fails if this file falls behind them.
+
+The library modules live outside `contracts/` deliberately. They declare no
+`gl.Contract` and are never deployed, so keeping them out of the contract
+directory leaves a validator exactly one candidate to check.
 """
 
 from genlayer import *
