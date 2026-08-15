@@ -289,9 +289,12 @@ def test_public_int_and_bool_params_are_coerced():
     truthiness, so an unguarded `set_agent(addr, "false")` would *grant* that
     address spending authority.
 
-    Asserted structurally rather than behaviorally because the installed
-    `genlayer` package is a stub: the contract cannot be imported here, so this
-    is the only place the property can be checked at all.
+    Asserted structurally rather than behaviorally because the claim is
+    universal. `test_contract_runtime.py` can now execute the artifact against
+    the real runner SDK and does check a handful of these rejections, but a
+    behavioral test only ever covers the parameters someone remembered to
+    write a case for. This one fails on a parameter nobody thought about --
+    including one added later.
 
     String parameters are out of scope -- they are guarded too, but by
     `_parse_address`, length limits, and `isinstance` checks whose correct form

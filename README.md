@@ -196,6 +196,8 @@ deployed bytes stay one reviewable artifact.
 | `tools/verify_submission.py` | lints every `.py` and asserts only the vault is a contract |
 | `tests/test_mandate_core.py` | behavior |
 | `tests/test_contract_sync.py` | guards on the artifact itself, and on the layout |
+| `tests/test_contract_constructor.py` | `__init__` against a hand-built stub SDK |
+| `tests/test_contract_runtime.py` | the artifact executed on the **real** pinned runner SDK |
 
 The split between `contracts/` and everything else is load-bearing, not
 cosmetic. A validator enumerating this repository finds exactly one candidate,
@@ -231,7 +233,7 @@ documented SDK exports.
 ```bash
 pip install -r requirements.txt
 
-python -m pytest -q                             # 176 tests
+python -m pytest -q                             # 260 tests
 python tools/build_contract.py --check          # fails if the artifact is stale
 python tools/verify_submission.py               # lints every .py in the repo
 genvm-lint check contracts/mandate_vault.py
@@ -310,32 +312,43 @@ establish.
 
 There are two copies of the SDK in play here, and conflating them would overstate
 what has been checked. The *importable* `genlayer` in `site-packages` is a
-zero-byte `__init__.py`, and `import genlayer_test` raises `ModuleNotFoundError`
--- so the direct-mode and integration suites have not been run. `genvm-lint`
-separately downloads the real SDK for the pinned runner into its own cache and
-type-checks against that, which is why `typecheck` is meaningful even though
-nothing here can execute the contract.
+zero-byte `__init__.py`, and `import genlayer_test` raises `ModuleNotFoundError`,
+so the direct-mode and integration suites shipped with the SDK have not been run.
+But `genvm-lint` downloads the **real** SDK for the pinned runner into
+`~/.cache/genvm-linter`, and that copy is executable: `test_contract_runtime.py`
+resolves it through `genvm_linter.validate.sdk_loader`, mocks `_genlayer_wasi`,
+and runs the artifact on the SDK's own `InmemManager`. Slots, type descriptors,
+and record copying are the runner's real code paths.
 
-So the type checker sees real signatures, and no runtime ever sees the contract:
+That closes the gap this section used to describe, and it closed it by finding
+something. `_active_clauses` passed each clause through
+`gl.storage.copy_to_memory`, which asserts on `__type_desc__` and therefore
+faults on a primitive -- and `DynArray[str]` returns a decoded `str`. Deployment
+succeeded; the first view call raised `AssertionError`, an unclassified VM fault,
+the moment the Studio explorer read the contract. Nothing that reasons about the
+artifact could have seen it: the AST guards check names and shapes, and the
+constructor test's stub wires `gl.storage` to raise on any access.
 
-- `request_spend` has **never executed against a live runtime**
-- **validator agreement is unverified** -- `verdicts_agree` is unit-tested
-  against constructed verdicts, but leader/validator convergence on real model
-  output has not been observed
+What remains unverified is the part that needs a network, not a runtime:
 
-One item that used to sit on that list has since been settled by reading the SDK
-rather than by running it. `simulate`, `spent_in_period` and `remaining_in_period`
-all reach `_now()`, which reads `gl.message_raw["datetime"]`, and it was unclear
-whether a read-only call carries a block time at all. It does: `MessageRawType`
-declares `datetime: str` as a required key, `message_raw` is decoded once from fd
-0 for every entry kind, and the neighbouring `stack: list[Address]` field is
-documented as the stack of *view* method calls -- so views travel through the
-same message as writes. There is no path that omits it.
+- **consensus is simulated, not observed.** `test_contract_runtime.py` runs both
+  halves of the round -- the leader function, then `validator_fn` against
+  `gl.vm.Return(leader_result)` exactly as the runner passes it -- and asserts
+  they agree. What it cannot do is run two nodes against two real model calls, so
+  leader/validator convergence on genuine model output is still unobserved.
+- **no GenVM.** Gas, the sandbox, cloudpickle serialization of the leader and
+  validator closures, and greyboxing are all absent.
+- **no model.** `gl.nondet.exec_prompt` is substituted per test, so the prompt is
+  asserted rather than answered.
 
-The deterministic engine, the prompt builder, the coercion layer, and the
-artifact guards are all covered by the 176 passing tests. The nondet path is
-covered by construction and reasoning only. That gap is the first thing to close
-on a machine with a working GenLayer test harness.
+One item that used to sit on that list was settled by reading the SDK rather than
+by running it. `simulate`, `spent_in_period` and `remaining_in_period` all reach
+`_now()`, which reads `gl.message_raw["datetime"]`, and it was unclear whether a
+read-only call carries a block time at all. It does: `MessageRawType` declares
+`datetime: str` as a required key, `message_raw` is decoded once from fd 0 for
+every entry kind, and the neighbouring `stack: list[Address]` field is documented
+as the stack of *view* method calls -- so views travel through the same message as
+writes. There is no path that omits it.
 
 A passing type check is also what caught nothing here: it is a guard against
 signature drift, not evidence the consensus logic is right. The one diagnostic it

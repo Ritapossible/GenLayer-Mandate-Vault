@@ -822,12 +822,19 @@ class MandateVault(gl.Contract):
         Revocation blanks a clause rather than removing it, so ids stay stable:
         a stored spend citing clause 3 still means clause 3 a year later, and
         history remains auditable after the mandate narrows.
+
+        `self.clauses[i]` is already a plain `str`: `StrDesc.get` decodes the
+        slot bytes and hands back an ordinary Python value, not a storage view.
+        `gl.storage.copy_to_memory` is for storage-backed composites -- it reads
+        `__type_desc__` off its argument and asserts it is present -- so calling
+        it on a primitive raises `AssertionError`, which is not a
+        `gl.vm.UserError` and escapes as an unclassified VM fault.
         """
         out: list[tuple[int, str]] = []
         for i in range(len(self.clauses)):
             if self.revoked[i]:
                 continue
-            out.append((i, gl.storage.copy_to_memory(self.clauses[i])))
+            out.append((i, self.clauses[i]))
         return out
 
     def _approved_newest_first(self):
