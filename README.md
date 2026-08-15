@@ -233,7 +233,7 @@ documented SDK exports.
 ```bash
 pip install -r requirements.txt
 
-python -m pytest -q                             # 260 tests
+python -m pytest -q                             # 272 tests
 python tools/build_contract.py --check          # fails if the artifact is stale
 python tools/verify_submission.py               # lints every .py in the repo
 genvm-lint check contracts/mandate_vault.py
@@ -464,6 +464,34 @@ so this file is the only place it can be checked at all.
 ## Known gaps
 
 - Validator agreement is unverified against a live runtime (see above).
-- History grows without bound. Reads are window-bounded, so this costs storage
-  rather than per-request time, but there is no pruning.
+- **History grows without bound.** Reads are window-bounded, so this costs
+  storage rather than per-request time, but there is no pruning.
+
+  Measured against the pinned runner's own storage descriptors, one recorded
+  spend costs exactly:
+
+  ```
+  181 bytes  +  len(memo)  +  len(outcome)  +  len(reason)
+  ```
+
+  Every variable-length field is stored verbatim and charged byte for byte, so
+  a denial is not cheaper than an approval -- only differently worded. The
+  ceiling is **2212 bytes**: a memo at the 2000-character `MAX_MEMO_CHARS` cap
+  under `auto_approved_allowlist`, the longest reason code `settle` can write.
+  A deploy of the two-clause mandate in the command above writes 383 bytes.
+
+  Against the public Studio's 256 MiB daily storage budget that is ~121,000
+  spends per day at the ceiling, or ~809,000 with a typical 120-character memo.
+  The quota does not bind here, and the first write each UTC day is allowed
+  regardless, so a contract cannot be locked out by it.
+
+  `test_contract_runtime.py` asserts the formula, the 2212-byte ceiling, and the
+  383-byte deploy, so these numbers fail loudly if the `Spend` record changes
+  rather than going stale in this file.
+
+  The obvious reduction -- storing `sha256(memo)` instead of the text, which
+  would cut the ceiling roughly tenfold -- is deliberately not taken. A stored
+  hash proves which memo was submitted only to someone who still holds the
+  original, and the party most likely to have discarded it is the one the
+  mandate exists to constrain.
 

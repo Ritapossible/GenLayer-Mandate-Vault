@@ -104,6 +104,17 @@ class Runtime:
         self.UserError = gl.vm.UserError
         self.owner = self.Address(OWNER_BYTES)
         self.agent = self.Address(AGENT_BYTES)
+        self.manager = None
+
+    def bytes_used(self) -> int:
+        """Total bytes across every slot of the current deployment.
+
+        `InmemManager` keeps each slot as a `bytearray`, so summing their
+        lengths is the storage footprint as the runner's own descriptors laid
+        it out -- not an estimate from the field types.
+        """
+        assert self.manager is not None, "nothing deployed yet"
+        return sum(len(memory) for _, memory in self.manager._parts.values())
 
     def set_sender(self, sender) -> None:
         """Rebind the message the contract reads.
@@ -130,7 +141,7 @@ class Runtime:
         from genlayer.py.storage._internal.core import InmemManager
         from genlayer.py.storage.root import Root
 
-        Root.MANAGER = InmemManager()
+        Root.MANAGER = self.manager = InmemManager()
         instance = Root.get().get_contract_instance(self.module.MandateVault)
         if not args and not kwargs:
             args = (CLAUSES, PER_TX_CAP, PERIOD_CAP, PERIOD_SECONDS, AUTO_APPROVE_UNDER)
@@ -474,6 +485,83 @@ def test_a_malformed_address_is_a_rejected_transaction(vault, runtime: Runtime):
         runtime.module.MandateVault.simulate(vault, "not-an-address", 1_000)
 
     assert excinfo.value.message.startswith(runtime.module.ERROR_EXPECTED)
+
+
+# --- what a stored spend actually costs ----------------------------------
+
+
+SPEND_RECORD_OVERHEAD = 181
+"""Fixed bytes per stored `Spend`, everything but its variable-length strings.
+
+Two addresses, four `u256` slots, a bool, and the bookkeeping the `DynArray`
+and the record descriptor add around them.
+"""
+
+
+@pytest.mark.parametrize("memo_chars", [0, 40, 200, 1000, 2000])
+@pytest.mark.parametrize("settles_as", ["approved", "denied"])
+def test_a_stored_spend_costs_its_overhead_plus_its_strings(
+    vault, runtime: Runtime, no_model, memo_chars, settles_as
+):
+    """The figure the README quotes, against the real storage layout.
+
+    A number in a README that nothing regenerates goes stale silently, so the
+    claim is made falsifiable here: change the `Spend` record and this fails
+    with the new cost rather than the README quietly becoming wrong.
+
+    The shape is what matters for capacity planning. Every variable-length
+    field is stored verbatim and charged byte for byte -- the memo, and also
+    `outcome` and `reason`, which is why a denial is not uniformly cheaper than
+    an approval but merely differently worded. Denials are recorded at full
+    price on purpose: the audit trail is the reason the contract exists.
+    """
+    contract = runtime.module.MandateVault
+    contract.set_allowlist(vault, PAYEE, True)
+    memo = "x" * memo_chars
+    amount = 5_000 if settles_as == "approved" else PER_TX_CAP + 1
+
+    before = runtime.bytes_used()
+    for _ in range(10):
+        result = contract.request_spend(vault, PAYEE, amount, memo)
+    per_spend = (runtime.bytes_used() - before) / 10
+
+    assert result["outcome"] == settles_as
+    assert per_spend == (
+        SPEND_RECORD_OVERHEAD + memo_chars + len(result["outcome"]) + len(result["reason"])
+    )
+    assert contract.total_spends(vault) == 10
+
+
+def test_the_worst_case_spend_is_the_one_the_readme_budgets_for(
+    vault, runtime: Runtime, no_model
+):
+    """2212 bytes: the memo at its cap, under the longest reason code.
+
+    `auto_approved_allowlist` is the longest string `settle` can write, so this
+    is the ceiling a daily storage budget has to be divided by.
+    """
+    contract = runtime.module.MandateVault
+    contract.set_allowlist(vault, PAYEE, True)
+    longest_reason = max(runtime.module.REASONS, key=len)
+
+    before = runtime.bytes_used()
+    result = contract.request_spend(vault, PAYEE, 5_000, "x" * runtime.module.MAX_MEMO_CHARS)
+
+    assert result["reason"] == longest_reason == "auto_approved_allowlist"
+    assert runtime.bytes_used() - before == 2212
+
+
+def test_a_deploy_writes_383_bytes_for_the_documented_mandate(runtime: Runtime):
+    """The baseline the per-spend figure sits on top of.
+
+    Measured for the two-clause mandate the README's deploy command uses, so
+    the two numbers quoted there come from the same configuration.
+    """
+    runtime.set_sender(runtime.owner)
+    runtime.deploy(CLAUSES, PER_TX_CAP, PERIOD_CAP, PERIOD_SECONDS, AUTO_APPROVE_UNDER)
+
+    assert sum(len(c) for c in CLAUSES) == 113
+    assert runtime.bytes_used() == 383
 
 
 def test_a_misconfigured_deploy_fails_at_construction(runtime: Runtime):
