@@ -117,15 +117,18 @@ genlayer deploy --contract contracts/mandate_vault.py --args \
   500000000 2000000000 604800 10000000 75 20
 ```
 
-Windows PowerShell 5.1 and `cmd.exe` need a different clause argument -- see
-below for why. In PowerShell, `--%` after the subcommand:
+Windows PowerShell 5.1 needs both the `.cmd` shim named explicitly and the
+stop-parsing token -- see below for why:
 
 ```powershell
-genlayer deploy --contract contracts/mandate_vault.py --% --args "[\"Cloud compute and GPU rental for model training or inference.\",\"Purchase or licensing of datasets used for training.\"]" 500000000 2000000000 604800 10000000 75 20
+genlayer.cmd --% deploy --contract contracts/mandate_vault.py --args "[\"Cloud compute and GPU rental for model training or inference.\",\"Purchase or licensing of datasets used for training.\"]" 500000000 2000000000 604800 10000000 75 20
 ```
 
-In `cmd.exe`, the same escaped argument without the `--%`. PowerShell 7 passes
-the POSIX form through correctly and needs neither.
+`genlayer.cmd`, not `genlayer`: PowerShell resolves the bare name to npm's
+`genlayer.ps1`, which forwards `$args` into its own `node` call. That second hop
+re-quotes the array after `--%` has stopped applying, so the token silently
+fails to help. `cmd.exe` takes the same escaped argument without `--%`, and
+PowerShell 7 passes the POSIX form through unchanged.
 
 `--args` is **variadic and positional**, not a keyword object: the CLI parses each
 value separately -- JSON arrays and objects are decoded, everything else is
@@ -164,6 +167,30 @@ and turn a rounding artifact into a consensus failure.
 | 5 | `auto_approve_under` | an allowlisted payee at or under this settles with no LLM call. `0` disables. |
 | 6 | `min_confidence` | below this, a clause match is downgraded to a denial |
 | 7 | `confidence_tol` | allowed leader/validator spread, approvals only |
+
+### Deployed instance
+
+The command above, run against GenLayer Studio:
+
+| | |
+|---|---|
+| network | `studionet` -- GenLayer Studio Network, chain id `61999` |
+| contract | `0x2334E39DFB3b3746A412b24455B630e5FC711239` |
+| deploy tx | `0x37d21153db91acc65d8dfbc2e1796ec1b775033fa731595efade794d1943b8aa` |
+| owner | `0xaA34e14a0e0B2fdD8Ad10F06bC0907fA0b1D02Bd` |
+| mandate digest | `71762c397f33980e614ba2db36440eaaafcfb9fa8b9c32eb4a9daf45d3bd044f` |
+
+Deployed with the two example clauses above and the limits in the same command,
+read back and confirmed on-chain:
+
+```bash
+genlayer call 0x2334E39DFB3b3746A412b24455B630e5FC711239 mandate
+genlayer call 0x2334E39DFB3b3746A412b24455B630e5FC711239 limits
+```
+
+The digest is the mandate's content address. It changes if a clause is added or
+revoked, so the value above pins the mandate this contract was deployed with --
+watch it to detect that the rules you were audited against have moved.
 
 ## API
 
