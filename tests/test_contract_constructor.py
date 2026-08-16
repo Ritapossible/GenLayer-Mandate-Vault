@@ -272,8 +272,35 @@ def test_clauses_must_be_a_list(clauses):
 
     A string is the dangerous one: it is iterable, so without the `isinstance`
     check the loop below would happily store one clause per character.
+
+    The rejection names the arrival type rather than reusing the empty-mandate
+    message, because the two failures are fixed in different places -- see
+    `test_a_shell_mangled_clause_array_says_what_arrived`.
     """
-    assert rejects(clauses=clauses) == f"{EXPECTED} mandate must have at least one clause"
+    assert rejects(clauses=clauses) == (
+        f"{EXPECTED} clauses must be an array of strings, got {type(clauses).__name__}"
+    )
+
+
+def test_a_shell_mangled_clause_array_says_what_arrived():
+    """The other real deploy failure, and why the message had to change.
+
+    `genlayer deploy --args` JSON-decodes each value on its own and forwards
+    anything that fails to parse as a scalar. So the clause array only survives
+    if its double quotes reach the CLI intact, and Windows PowerShell 5.1 hands
+    a native command `["a","b"]` as `[a,b]` -- quotes consumed as delimiters,
+    the argument arriving as one string. Verified against the CLI's own
+    `parseArg` at genlayer 0.38.9; the README's Deploying section carries the
+    invocation that survives.
+
+    Both that and an empty deploy form used to raise "mandate must have at
+    least one clause", which points at the mandate for someone whose command
+    plainly passes two clauses. Naming the type points at the shell instead.
+    """
+    mangled = "[Cloud compute and GPU rental., Purchase or licensing of datasets.]"
+    assert rejects(clauses=mangled) == (
+        f"{EXPECTED} clauses must be an array of strings, got str"
+    )
 
 
 @pytest.mark.parametrize(

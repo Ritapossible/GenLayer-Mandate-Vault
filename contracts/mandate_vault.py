@@ -754,7 +754,25 @@ class MandateVault(gl.Contract):
         min_confidence: int = 75,
         confidence_tol: int = 20,
     ):
-        if not isinstance(clauses, list) or not clauses:
+        # The two ways a mandate arrives unusable are separate rejections
+        # because they have different remedies, and a single message for both
+        # sent at least one deploy chasing the wrong one.
+        #
+        # `[]` is a deploy that supplied no clauses -- an empty Studio form.
+        #
+        # A non-list is a deploy whose clause array never survived the shell.
+        # `--args` is JSON-decoded per value by the CLI, so the array has to
+        # reach it with its double quotes intact; a shell that eats them leaves
+        # `["a","b"]` as the string `[a,b]`, which fails `JSON.parse` and is
+        # forwarded as a scalar. Naming the arrival type says so, where "at
+        # least one clause" reads as "you passed none" to someone looking at a
+        # command that plainly passes two.
+        if not isinstance(clauses, list):
+            raise gl.vm.UserError(
+                f"{ERROR_EXPECTED} clauses must be an array of strings, got "
+                f"{type(clauses).__name__}"
+            )
+        if not clauses:
             raise gl.vm.UserError(f"{ERROR_EXPECTED} mandate must have at least one clause")
         for text in clauses:
             if not isinstance(text, str) or not text.strip():

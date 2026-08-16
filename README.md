@@ -109,11 +109,23 @@ is the durable property, not preventing agreement.
 
 ## Deploying
 
+POSIX shells -- bash, zsh, Git Bash, WSL:
+
 ```bash
 genlayer deploy --contract contracts/mandate_vault.py --args \
   '["Cloud compute and GPU rental for model training or inference.","Purchase or licensing of datasets used for training."]' \
   500000000 2000000000 604800 10000000 75 20
 ```
+
+Windows PowerShell 5.1 and `cmd.exe` need a different clause argument -- see
+below for why. In PowerShell, `--%` after the subcommand:
+
+```powershell
+genlayer deploy --contract contracts/mandate_vault.py --% --args "[\"Cloud compute and GPU rental for model training or inference.\",\"Purchase or licensing of datasets used for training.\"]" 500000000 2000000000 604800 10000000 75 20
+```
+
+In `cmd.exe`, the same escaped argument without the `--%`. PowerShell 7 passes
+the POSIX form through correctly and needs neither.
 
 `--args` is **variadic and positional**, not a keyword object: the CLI parses each
 value separately -- JSON arrays and objects are decoded, everything else is
@@ -122,6 +134,22 @@ constructor order, and passing one `'{"per_tx_cap": ...}'` object instead would
 arrive as a single dict in `clauses` and be rejected. Because the arguments are
 positional, an earlier one cannot be skipped to reach a later one -- set
 `period_seconds` explicitly if you want to override `min_confidence`.
+
+That per-value decode is also what makes the clause array shell-sensitive. The
+CLI runs `JSON.parse` on each argument and **forwards anything that fails to
+parse as a scalar string** rather than reporting it, so the array only arrives
+as an array if its double quotes reach the CLI intact. Windows PowerShell 5.1
+hands a native command `'["a","b"]'` as `[a,b]` -- the quotes are consumed as
+delimiters -- and the constructor then sees one string where it wanted a list:
+
+```
+[EXPECTED] clauses must be an array of strings, got str
+```
+
+That is the diagnosis, not a mandate problem: the clauses were typed, the shell
+ate the quotes. `[EXPECTED] mandate must have at least one clause` is the other
+failure -- a deploy that genuinely supplied none, which is what an empty Studio
+deploy form sends.
 
 All amounts are **integer base units**. There are no floats anywhere in the
 deterministic path -- a float would make two validators disagree in the last bit
