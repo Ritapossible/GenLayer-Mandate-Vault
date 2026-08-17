@@ -33,6 +33,15 @@ trusted input. Confidence is deliberately not compared on denials -- the number
 changes no outcome there, so comparing it would manufacture disagreement without
 buying safety.
 
+The comparison happens *after* canonicalization, never before. The leader's
+calldata is admitted only if `canonicalize_verdict` leaves it unchanged
+(`canonical_leader_verdict`), which is the same coercion the agreed result
+passes through on its way to storage. Compare earlier than that and the
+tolerance spans the `min_confidence` threshold: 74 and 94 are both within 20 of
+an independently computed 94, but one stores a denial and the other an approval.
+The tolerance absorbs spread among approvals; it must not carry agreement across
+the line that decides whether the spend happens.
+
 Injection containment. The model is asked only whether a purpose fits a clause.
 It never sees an amount, a balance, a cap, or a party name, so memo text has no
 lever even if the model obeys it -- nothing in the prompt connects an answer to
@@ -410,7 +419,12 @@ def canonicalize_verdict(
     else:
         try:
             parsed = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
+        except (ValueError, TypeError):
+            # `ValueError`, not `json.JSONDecodeError`. Undecodable bytes raise
+            # `UnicodeDecodeError`, which is a `ValueError` and *not* a
+            # `JSONDecodeError`, and `run_nondet_unsafe` hands this function the
+            # leader's raw calldata. Catching only the narrower class left the
+            # one path that must never fault able to fault.
             return dict(DENY_VERDICT)
     if not isinstance(parsed, dict):
         return dict(DENY_VERDICT)
@@ -444,6 +458,63 @@ def encode_verdict(verdict: dict) -> str:
     return json.dumps(verdict, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
 
 
+def canonical_leader_verdict(
+    raw: object,
+    allowed_clause_ids: frozenset[int],
+    limits: Limits,
+) -> dict | None:
+    """The leader's reported verdict, accepted only if it is already canonical.
+
+    Returns the verdict when `raw` is a fixed point of `canonicalize_verdict`,
+    and `None` otherwise. `None` means "not comparable" and its only correct
+    handling is to disagree.
+
+    This is the decode counterpart of `encode_verdict`, and it exists because of
+    where the leader's value ends up. The agreed result is fed back through
+    `canonicalize_verdict` before it becomes the stored outcome, so the only
+    honest thing to compare against is a value that coercion will not move.
+    Compare a pre-coercion value and the validator ratifies one verdict while
+    the contract stores another.
+
+    The concrete failure that made this necessary: with `min_confidence` 75 and
+    `confidence_tol` 20, a leader reporting confidence 74 is within tolerance of
+    an independently computed 94, so the old field-by-field comparison agreed --
+    and then 74 canonicalized to a denial while 94 canonicalized to an approval.
+    Two leader values, both ratified by the same validator run, settling to
+    opposite outcomes for the same request. Requiring the fixed point removes
+    the gap: what the validator compared is exactly what gets written.
+
+    An honest leader never trips this. `leader_fn` returns the encoding of a
+    verdict `canonicalize_verdict` has already produced, and that function is
+    idempotent, so its output is a fixed point by construction. A value that
+    fails here is a leader that did not run this code, which is the case
+    rotation exists for.
+
+    Total, like everything else on this path: hostile bytes return `None`, never
+    an exception.
+    """
+    if isinstance(raw, dict):
+        parsed: object = raw
+    elif isinstance(raw, (str, bytes, bytearray)):
+        # `ValueError` covers both `json.JSONDecodeError` and the
+        # `UnicodeDecodeError` that undecodable bytes raise; see
+        # `canonicalize_verdict`, which takes calldata the same way.
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return None
+    else:
+        return None
+
+    if not isinstance(parsed, dict):
+        return None
+
+    canonical = canonicalize_verdict(parsed, allowed_clause_ids, limits)
+    if parsed != canonical:
+        return None
+    return canonical
+
+
 def verdicts_agree(mine: dict, theirs: dict, limits: Limits) -> bool:
     """Compare two verdicts field by field.
 
@@ -457,6 +528,14 @@ def verdicts_agree(mine: dict, theirs: dict, limits: Limits) -> bool:
     nothing -- the spend is refused either way -- so comparing it would
     manufacture disagreement without buying any safety. Approvals are where the
     number gates the outcome, so that is where the tolerance applies.
+
+    On an approval the tolerance is applied *inside* the approval bucket: both
+    numbers must already clear `min_confidence`. `confidence_tol` absorbs
+    sampling spread among answers that all mean "approve"; it must never carry
+    agreement across the line that decides whether the spend happens. Callers
+    are expected to pass canonical verdicts -- `canonical_leader_verdict` is how
+    the untrusted side becomes one -- and the bucket check is repeated here so
+    the guarantee holds for any caller, not only the careful one.
     """
     if not isinstance(mine, dict) or not isinstance(theirs, dict):
         return False
@@ -488,6 +567,17 @@ def verdicts_agree(mine: dict, theirs: dict, limits: Limits) -> bool:
         return False
     if isinstance(their_conf, bool) or not isinstance(their_conf, int):
         return False
+
+    # The threshold gate, before the tolerance. A confidence below
+    # `min_confidence` does not describe an approval at all -- it canonicalizes
+    # to a denial -- so it cannot be inside the spread of one, however close the
+    # two numbers look. The upper bound is the clamp `canonicalize_verdict`
+    # applies, restated so an uncanonicalized 5000 cannot pose as a 100.
+    if not limits.min_confidence <= mine_conf <= 100:
+        return False
+    if not limits.min_confidence <= their_conf <= 100:
+        return False
+
     return abs(mine_conf - their_conf) <= limits.confidence_tol
 
 
@@ -1141,24 +1231,26 @@ class MandateVault(gl.Contract):
                 # `VMError` (OOM, exit code) carries no classified message, so
                 # there is nothing to compare on. Disagree and force rotation.
                 return False
-            try:
-                theirs = json.loads(leader_res.calldata)
-            except (json.JSONDecodeError, TypeError):
+            # Decode the leader's calldata into the verdict it claims, accepting
+            # it only in canonical form. This is the same coercion the agreed
+            # result passes through on its way to storage, so requiring a fixed
+            # point of it is what makes "the validator agreed" and "this is what
+            # gets written" the same statement.
+            #
+            # Comparing the reported numbers directly is what got a previous
+            # revision rejected: `confidence` was compared before the
+            # `min_confidence` threshold, so with a minimum of 75 and a
+            # tolerance of 20 a leader reporting 74 and a leader reporting 94
+            # both validated against an independently computed 94 -- and then
+            # stored a denial and an approval respectively.
+            #
+            # It also subsumes every shape check that used to stand here: key
+            # set, decision vocabulary, and a bool `clause_id` posing as clause
+            # 1 all fail the fixed-point test, because `canonicalize_verdict`
+            # rejects each of them and its output is not what came in.
+            theirs = canonical_leader_verdict(leader_res.calldata, allowed, limits)
+            if theirs is None:
                 return False
-            if not isinstance(theirs, dict):
-                return False
-            if set(theirs.keys()) != {"decision", "clause_id", "confidence"}:
-                return False
-            if theirs["decision"] not in DECISIONS:
-                return False
-            # A bool is rejected before the membership test, because `True == 1`
-            # would let a leader cite clause 1 without naming it.
-            cid = theirs["clause_id"]
-            if cid is not None:
-                if isinstance(cid, bool) or not isinstance(cid, int):
-                    return False
-                if cid not in allowed:
-                    return False
             # Re-do the work independently. Shape-checking the leader's answer
             # would validate formatting, not correctness.
             mine = _review(

@@ -402,6 +402,21 @@ class TestVerdictCanonicalization:
         )
         assert got == {"decision": "inside", "clause_id": 0, "confidence": 90}
 
+    @pytest.mark.parametrize(
+        "raw",
+        [b"\xff", b"\x80abc", bytearray(b"\xfe\xff"), b"", b"{}"],
+        ids=["invalid-utf8", "lone-continuation", "bytearray", "empty", "empty-object"],
+    )
+    def test_raw_bytes_deny_without_raising(self, raw):
+        """`run_nondet_unsafe` hands the leader's calldata over unparsed.
+
+        Undecodable bytes raise `UnicodeDecodeError`, which is a `ValueError`
+        but *not* a `json.JSONDecodeError` -- so catching only the narrower
+        class let the one function documented as total fault, as an
+        unclassified VM error, on the exact path that must never produce one.
+        """
+        assert self.canon(raw) == core.DENY_VERDICT
+
     def test_empty_allowed_set_denies_everything(self):
         got = core.canonicalize_verdict(
             {"decision": "inside", "clause_id": 0, "confidence": 100},
@@ -490,6 +505,252 @@ class TestVerdictAgreementIsTotal:
     def test_a_valid_approval_still_agrees(self):
         """The hardening must not have broken the path it guards."""
         assert core.verdicts_agree(self.APPROVAL, dict(self.APPROVAL), LIMITS)
+
+
+class TestLeaderVerdictIsComparedCanonically:
+    """The rejection this class exists for.
+
+    `confidence` was compared as the leader reported it, before the
+    `min_confidence` threshold. With a minimum of 75 and a tolerance of 20, a
+    leader reporting 74 and a leader reporting 94 both fell within tolerance of
+    an independently computed 94, so the validator ratified either -- and the
+    contract then stored a denial for the first and an approval for the second.
+    The same request, the same validator run, opposite outcomes.
+
+    `canonical_leader_verdict` admits a leader value only if
+    `canonicalize_verdict` leaves it unchanged, which is the same coercion that
+    turns the agreed result into the stored one. That makes "the validator
+    agreed" and "this is what gets written" the same statement.
+    """
+
+    ALLOWED = frozenset({0, 1, 2})
+    APPROVAL = {"decision": "inside", "clause_id": 1, "confidence": 94}
+
+    def leader(self, raw):
+        return core.canonical_leader_verdict(raw, self.ALLOWED, LIMITS)
+
+    def validator_agrees(self, raw, mine):
+        """The validator half of the consensus round, as the contract runs it."""
+        theirs = self.leader(raw)
+        if theirs is None:
+            return False
+        return core.verdicts_agree(mine, theirs, LIMITS)
+
+    # --- the property that was violated ---
+
+    @pytest.mark.parametrize("leader_confidence", list(range(0, 101)))
+    def test_agreement_implies_the_stored_spend_settles_as_the_validator_judged(
+        self, leader_confidence
+    ):
+        """Whatever the validator ratified decides the spend the way it judged.
+
+        The stored `confidence` is the leader's and is allowed to differ within
+        `confidence_tol` -- absorbing that spread is what the tolerance is for.
+        What may never differ is the part that moves money: outcome, reason, and
+        the clause cited. That is exactly what the rejection reported, where 74
+        and 94 both validated and then settled as denied and approved.
+
+        Swept across every representable confidence rather than the two values
+        from the report, because the defect was a boundary between buckets and
+        one more threshold could open another.
+        """
+        escalated = core.Screen(core.ESCALATE, core.REASON_NEEDS_REVIEW)
+        raw = core.encode_verdict(
+            {"decision": "inside", "clause_id": 1, "confidence": leader_confidence}
+        )
+        mine = core.canonicalize_verdict(dict(self.APPROVAL), self.ALLOWED, LIMITS)
+
+        # What `_clause_verdict` hands to `_commit` is the leader's calldata put
+        # through the same coercion, so that is what agreement has to be about.
+        stored = core.canonicalize_verdict(raw, self.ALLOWED, LIMITS)
+
+        if self.validator_agrees(raw, mine):
+            outcome, reason, clause_id, _ = core.settle(escalated, stored)
+            assert (outcome, reason, clause_id) == core.settle(escalated, mine)[:3]
+
+    def test_the_sweep_is_not_vacuous(self):
+        """A gate that rejected everything would pass the sweep and be useless."""
+        mine = core.canonicalize_verdict(dict(self.APPROVAL), self.ALLOWED, LIMITS)
+        agreeing = [
+            c for c in range(0, 101)
+            if self.validator_agrees(
+                core.encode_verdict(
+                    {"decision": "inside", "clause_id": 1, "confidence": c}
+                ),
+                mine,
+            )
+        ]
+
+        # Exactly the approvals within tolerance of 94: [75, 100] intersected
+        # with [74, 114].
+        assert agreeing == list(range(75, 101))
+
+    def test_the_reported_pair_no_longer_validates_the_same(self):
+        """74 and 94 must not both pass against an independently computed 94."""
+        mine = core.canonicalize_verdict(dict(self.APPROVAL), self.ALLOWED, LIMITS)
+        below = core.encode_verdict(
+            {"decision": "inside", "clause_id": 1, "confidence": 74}
+        )
+        above = core.encode_verdict(
+            {"decision": "inside", "clause_id": 1, "confidence": 94}
+        )
+
+        assert not self.validator_agrees(below, mine), "74 canonicalizes to a denial"
+        assert self.validator_agrees(above, mine)
+
+    # --- an honest leader is never rotated ---
+
+    @pytest.mark.parametrize(
+        "model_response",
+        [
+            {"decision": "inside", "clause_id": 0, "confidence": 100},
+            {"decision": "inside", "clause_id": 2, "confidence": 75},
+            {"decision": "outside", "clause_id": None, "confidence": 0},
+            {"decision": "  INSIDE ", "clause_id": 1, "confidence": 5000},
+            {"decision": "inside", "clause_id": 99, "confidence": 90},
+            {"decision": "inside", "clause_id": 1, "confidence": 74},
+            "not json at all",
+            {},
+        ],
+        ids=[
+            "approval", "at-threshold", "denial", "needs-clamping",
+            "unknown-clause", "below-threshold", "garbage", "empty",
+        ],
+    )
+    def test_anything_this_contract_produces_is_accepted_verbatim(self, model_response):
+        """`leader_fn` emits `encode_verdict(canonicalize_verdict(...))`.
+
+        That output is a fixed point by construction, so a leader running this
+        code never trips the check. If it could, every escalated spend would
+        rotate validators forever.
+        """
+        honest = core.canonicalize_verdict(model_response, self.ALLOWED, LIMITS)
+
+        got = self.leader(core.encode_verdict(honest))
+
+        assert got == honest
+        assert core.verdicts_agree(honest, got, LIMITS)
+
+    def test_accepts_a_dict_as_well_as_its_encoding(self):
+        canonical = dict(self.APPROVAL)
+        assert self.leader(canonical) == canonical
+        assert self.leader(core.encode_verdict(canonical)) == canonical
+
+    # --- everything non-canonical is not comparable ---
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            {"decision": "inside", "clause_id": 1, "confidence": 74},
+            {"decision": "inside", "clause_id": 1, "confidence": 5000},
+            {"decision": "inside", "clause_id": 1, "confidence": -1},
+            {"decision": "INSIDE", "clause_id": 1, "confidence": 94},
+            {"decision": " inside", "clause_id": 1, "confidence": 94},
+            {"decision": "inside", "clause_id": 99, "confidence": 94},
+            {"decision": "inside", "clause_id": True, "confidence": 94},
+            {"decision": "inside", "clause_id": None, "confidence": 94},
+            {"decision": "outside", "clause_id": 1, "confidence": 0},
+            {"decision": "outside", "clause_id": None, "confidence": 90},
+            {"decision": "maybe", "clause_id": 1, "confidence": 94},
+            {"decision": "inside", "clause_id": 1, "confidence": 94, "extra": "x"},
+            {"decision": "inside", "clause_id": 1},
+            {"clause_id": 1, "confidence": 94},
+            {},
+        ],
+        ids=[
+            "below-threshold", "unclamped-high", "unclamped-low", "uppercase",
+            "padded", "unknown-clause", "bool-clause", "null-clause-on-approval",
+            "denial-citing-a-clause", "denial-with-confidence", "unknown-decision",
+            "extra-key", "missing-confidence", "missing-decision", "empty",
+        ],
+    )
+    def test_non_canonical_leader_output_is_not_comparable(self, raw):
+        """`None` is the vote to rotate, and it is the only safe answer.
+
+        A value the coercion would move means something different by the time it
+        reaches storage, so there is nothing here a validator can honestly
+        ratify -- including the shape checks this replaced, which are all still
+        enforced because `canonicalize_verdict` rejects each of these.
+        """
+        assert self.leader(raw) is None
+        assert self.leader(core.encode_verdict(raw)) is None
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "", "not json", "[]", "null", "42", '"inside"', None, 42, [],
+            b"", b"\xff", bytearray(b"\xfe\xff"), object(),
+        ],
+        ids=[
+            "empty", "prose", "list", "null", "number", "quoted-string",
+            "none", "int", "pylist", "empty-bytes", "invalid-utf8",
+            "bytearray", "object",
+        ],
+    )
+    def test_is_total_over_unusable_calldata(self, raw):
+        """Untrusted input must resolve to a disagreement, never an exception.
+
+        A `TypeError` raised inside `validator_fn` is an unclassified VM fault
+        that no validator can compare; `None` is a clean vote to rotate.
+        """
+        assert self.leader(raw) is None  # must not raise
+
+    def test_an_empty_mandate_makes_every_approval_uncomparable(self):
+        """After the last clause is revoked, no citation can be canonical."""
+        raw = core.encode_verdict(dict(self.APPROVAL))
+        assert core.canonical_leader_verdict(raw, frozenset(), LIMITS) is None
+
+
+class TestToleranceStaysInsideTheApprovalBucket:
+    """`confidence_tol` absorbs spread among approvals, nothing more.
+
+    The threshold gate is repeated inside `verdicts_agree` rather than left to
+    the caller, so the defect cannot return through a second call site that
+    forgets to canonicalize first.
+    """
+
+    def approval(self, confidence):
+        return {"decision": "inside", "clause_id": 1, "confidence": confidence}
+
+    def test_a_sub_threshold_confidence_never_agrees_with_an_approval(self):
+        assert not core.verdicts_agree(self.approval(94), self.approval(74), LIMITS)
+
+    def test_it_is_refused_from_either_side(self):
+        assert not core.verdicts_agree(self.approval(74), self.approval(94), LIMITS)
+
+    def test_two_sub_threshold_values_do_not_agree_by_being_close(self):
+        """Neither describes an approval, so their closeness proves nothing."""
+        assert not core.verdicts_agree(self.approval(70), self.approval(74), LIMITS)
+
+    def test_the_threshold_itself_is_inside_the_bucket(self):
+        """Same boundary `canonicalize_verdict` uses: `>=`, not `>`."""
+        assert core.verdicts_agree(self.approval(75), self.approval(94), LIMITS)
+        assert not core.verdicts_agree(self.approval(74), self.approval(94), LIMITS)
+
+    def test_an_unclamped_confidence_cannot_pose_as_a_hundred(self):
+        assert not core.verdicts_agree(self.approval(100), self.approval(5000), LIMITS)
+
+    def test_tolerance_still_applies_within_the_bucket(self):
+        """The hardening must not have broken what the tolerance is for."""
+        assert core.verdicts_agree(self.approval(100), self.approval(80), LIMITS)
+        assert not core.verdicts_agree(self.approval(100), self.approval(79), LIMITS)
+
+    def test_denials_are_untouched_by_the_gate(self):
+        """Confidence gates nothing on a denial, so it is still not compared."""
+        assert core.verdicts_agree(
+            dict(core.DENY_VERDICT),
+            {"decision": "outside", "clause_id": None, "confidence": 100},
+            LIMITS,
+        )
+
+    def test_a_zero_minimum_admits_the_whole_range(self):
+        """The gate is `min_confidence`, not a hardcoded 75."""
+        permissive = core.Limits(
+            per_tx_cap=1000, period_cap=5000, period_seconds=604800,
+            min_confidence=0, confidence_tol=20,
+        )
+        assert core.verdicts_agree(self.approval(0), self.approval(20), permissive)
+        assert not core.verdicts_agree(self.approval(0), self.approval(21), permissive)
 
 
 class TestStorageBounds:

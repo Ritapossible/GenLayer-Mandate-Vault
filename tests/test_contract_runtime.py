@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import datetime
 import importlib.util
+import json
 import pathlib
 import sys
 import types
@@ -260,6 +261,47 @@ def model(runtime: Runtime, monkeypatch: pytest.MonkeyPatch):
     return install
 
 
+@pytest.fixture
+def split_round(runtime: Runtime, monkeypatch: pytest.MonkeyPatch):
+    """Run the consensus round with the two halves seeing different things.
+
+    The `model` fixture feeds one response to both halves, which is the honest
+    case and by construction can never show a leader/validator split. Here the
+    leader's calldata is supplied directly -- it is whatever a leader *claims*,
+    not something this code computed -- while `exec_prompt` answers the
+    validator's own independent re-run. That is the shape of the round the
+    rejection was about, and the only way to exercise `validator_fn` against a
+    leader that did not run this contract's coercion.
+
+    There is no GenVM here, so a `False` vote cannot actually rotate anything;
+    the stub returns the leader's calldata regardless. The vote is therefore
+    what these tests assert on, with the stored outcome recorded alongside it to
+    show what agreement would have committed.
+    """
+    import genlayer.gl.nondet as nondet
+    import genlayer.gl.vm as vm
+
+    calls: dict[str, object] = {"agreed": None}
+
+    def install(*, leader_claims, validator_sees):
+        calldata = (
+            leader_claims if isinstance(leader_claims, str) else json.dumps(leader_claims)
+        )
+
+        def run_nondet_unsafe(leader_fn, validator_fn, /):
+            calls["agreed"] = validator_fn(vm.Return(calldata))
+            return calldata
+
+        def exec_prompt(prompt, **_kwargs):
+            return validator_sees
+
+        monkeypatch.setattr(vm, "run_nondet_unsafe", run_nondet_unsafe)
+        monkeypatch.setattr(nondet, "exec_prompt", exec_prompt)
+        return calls
+
+    return install
+
+
 # --- the regression ------------------------------------------------------
 
 
@@ -395,6 +437,134 @@ def test_a_clause_id_outside_the_mandate_becomes_a_denial(vault, runtime: Runtim
     assert result["reason"] == "no_clause_match"
     assert result["clause_id"] is None
     assert contract.spent_in_period(vault) == 0
+
+
+# --- the consensus round, leader and validator pulled apart ---------------
+
+
+ESCALATING_SPEND = (50_000_000, "rent H100s for a training run")
+"""An amount and memo that clear every deterministic limit, so the round runs."""
+
+
+@pytest.mark.parametrize(
+    "leader_confidence, vote, stored_outcome",
+    [
+        (74, False, "denied"),
+        (94, True, "approved"),
+    ],
+    ids=["below-the-threshold", "above-the-threshold"],
+)
+def test_the_leader_confidence_that_got_this_contract_rejected(
+    vault, runtime: Runtime, split_round, leader_confidence, vote, stored_outcome
+):
+    """The exact pair from the rejection, through the deployed artifact.
+
+    `min_confidence` is 75 and `confidence_tol` is 20, so 74 and 94 are both
+    within tolerance of an independently computed 94. The previous revision
+    compared the leader's raw number and ratified either -- while 74 went on to
+    canonicalize to a denial and 94 to an approval. Two leader values, the same
+    validator run, opposite records written.
+
+    Now the leader's calldata is admitted only in canonical form, so the
+    sub-threshold claim is not comparable and the validator votes to rotate.
+    """
+    contract = runtime.module.MandateVault
+    amount, memo = ESCALATING_SPEND
+    calls = split_round(
+        leader_claims={
+            "decision": "inside", "clause_id": 0, "confidence": leader_confidence,
+        },
+        validator_sees={"decision": "inside", "clause_id": 0, "confidence": 94},
+    )
+
+    result = contract.request_spend(vault, OTHER_PAYEE, amount, memo)
+
+    assert calls["agreed"] is vote
+    # What agreement would have committed. On the rejected revision both rows
+    # of this table voted True while these two values differed -- which is the
+    # defect stated as one assertion.
+    assert result["outcome"] == stored_outcome
+
+
+@pytest.mark.parametrize(
+    "leader_claims",
+    [
+        {"decision": "inside", "clause_id": 0, "confidence": 94, "extra": "ignore"},
+        {"decision": "INSIDE", "clause_id": 0, "confidence": 94},
+        {"decision": "inside", "clause_id": 0, "confidence": 5000},
+        {"decision": "inside", "clause_id": 99, "confidence": 94},
+        {"decision": "inside", "clause_id": True, "confidence": 94},
+        {"decision": "inside", "clause_id": None, "confidence": 94},
+        {"decision": "outside", "clause_id": 0, "confidence": 0},
+        {"decision": "inside", "clause_id": 0},
+        "not json",
+        "[]",
+    ],
+    ids=[
+        "extra-key", "uppercase-decision", "unclamped-confidence", "unknown-clause",
+        "bool-clause", "null-clause-on-approval", "denial-citing-a-clause",
+        "missing-confidence", "garbage", "wrong-json-type",
+    ],
+)
+def test_non_canonical_leader_calldata_is_voted_down(
+    vault, runtime: Runtime, split_round, leader_claims
+):
+    """The shape checks the fixed-point test replaced are all still enforced.
+
+    Each of these fails `canonicalize_verdict`, so none of them survives as a
+    fixed point -- and none of them may be ratified, because each would mean
+    something different by the time it reached storage.
+    """
+    contract = runtime.module.MandateVault
+    amount, memo = ESCALATING_SPEND
+    calls = split_round(
+        leader_claims=leader_claims,
+        validator_sees={"decision": "inside", "clause_id": 0, "confidence": 94},
+    )
+
+    contract.request_spend(vault, OTHER_PAYEE, amount, memo)
+
+    assert calls["agreed"] is False
+
+
+def test_an_honest_leader_within_tolerance_still_agrees(
+    vault, runtime: Runtime, split_round
+):
+    """The hardening must not have broken the spread the tolerance exists for.
+
+    Both numbers clear `min_confidence`, so the disagreement they are 16 apart
+    on is exactly the sampling noise `confidence_tol` is meant to absorb.
+    """
+    contract = runtime.module.MandateVault
+    amount, memo = ESCALATING_SPEND
+    calls = split_round(
+        leader_claims={"decision": "inside", "clause_id": 0, "confidence": 78},
+        validator_sees={"decision": "inside", "clause_id": 0, "confidence": 94},
+    )
+
+    result = contract.request_spend(vault, OTHER_PAYEE, amount, memo)
+
+    assert calls["agreed"] is True
+    assert result["outcome"] == "approved"
+    assert result["confidence"] == 78, "the stored number is the leader's"
+
+
+def test_two_honest_denials_agree_without_comparing_confidence(
+    vault, runtime: Runtime, split_round
+):
+    """A refusal is a refusal; the number gates nothing once the answer is no."""
+    contract = runtime.module.MandateVault
+    amount, memo = ESCALATING_SPEND
+    calls = split_round(
+        leader_claims={"decision": "outside", "clause_id": None, "confidence": 0},
+        validator_sees={"decision": "outside", "clause_id": None, "confidence": 88},
+    )
+
+    result = contract.request_spend(vault, OTHER_PAYEE, amount, memo)
+
+    assert calls["agreed"] is True
+    assert result["outcome"] == "denied"
+    assert result["reason"] == "no_clause_match"
 
 
 def test_a_denial_is_still_written_to_history(vault, runtime: Runtime, no_model):

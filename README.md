@@ -77,12 +77,44 @@ Validators **re-run the whole leader computation** -- including a real LLM call
 of their own -- and then compare field by field:
 
 - `decision` and `clause_id` -- exactly
-- `confidence` -- within `confidence_tol`, and **only for approvals**
+- `confidence` -- within `confidence_tol`, and **only for approvals**, and only
+  once both numbers are already inside the approval bucket
 
 Nothing is trusted from the leader beyond the values being compared, per
 GenLayer's rule that the leader's result is never trusted input. Confidence is
 deliberately not compared on denials: the number changes no outcome there, so
 comparing it would manufacture disagreement without buying safety.
+
+### Compare after coercion, never before
+
+The leader's calldata is admitted only in **canonical** form -- a value
+`canonicalize_verdict` leaves unchanged (`canonical_leader_verdict`). That is
+the same coercion the agreed result passes through on its way to storage, so
+"the validator agreed" and "this is what gets written" are the same statement.
+Anything else is not comparable and the validator votes to rotate.
+
+This is load-bearing, and getting it wrong is what got an earlier revision of
+this contract rejected. `confidence` was compared as the leader reported it,
+*before* the `min_confidence` threshold. With a minimum of 75 and a tolerance of
+20, a leader reporting **74** and a leader reporting **94** are both within
+tolerance of an independently computed 94 -- so the validator ratified either,
+and the contract then stored a denial for the first and an approval for the
+second. Same request, same validator run, opposite records.
+
+Two changes close it, and either would have:
+
+- `canonical_leader_verdict` rejects a leader value the coercion would move, so
+  a sub-threshold claim never reaches the comparison.
+- `verdicts_agree` applies `confidence_tol` strictly inside the approval bucket
+  -- both numbers must already clear `min_confidence`. The tolerance absorbs
+  sampling spread among answers that all mean "approve"; it must never carry
+  agreement across the line that decides whether the spend happens.
+
+Both are kept, so the invariant does not depend on a single call site
+remembering to canonicalize first. The rule generalizes past this contract: when
+a validator's comparison sits on one side of a threshold and the stored value
+sits on the other, tolerance leaks across the boundary. Compare the bucket the
+outcome is decided in, not the raw number.
 
 ## Prompt-injection containment
 
@@ -170,27 +202,47 @@ and turn a rounding artifact into a consensus failure.
 
 ### Deployed instance
 
-The command above, run against GenLayer Studio:
+The command above, run against GenLayer Studio. **This is the submitted
+deployment**, and it carries the fix described under [Compare after coercion,
+never before](#compare-after-coercion-never-before):
 
 | | |
 |---|---|
 | network | `studionet` -- GenLayer Studio Network, chain id `61999` |
-| contract | `0x2334E39DFB3b3746A412b24455B630e5FC711239` |
-| deploy tx | `0x37d21153db91acc65d8dfbc2e1796ec1b775033fa731595efade794d1943b8aa` |
+| contract | `0xdAf45c47d23e62de5F9423939b86358F150485b9` |
+| deploy tx | `0xf387eb19e3be2bbf1ba946122459e16828eaba217e2ed90b052b9829f9279d54` |
 | owner | `0xaA34e14a0e0B2fdD8Ad10F06bC0907fA0b1D02Bd` |
 | mandate digest | `71762c397f33980e614ba2db36440eaaafcfb9fa8b9c32eb4a9daf45d3bd044f` |
+
+The deploy settled `ACCEPTED` / `MAJORITY_AGREE` in a single round, three of five
+round validators voting `AGREE` and none rotating.
 
 Deployed with the two example clauses above and the limits in the same command,
 read back and confirmed on-chain:
 
 ```bash
-genlayer call 0x2334E39DFB3b3746A412b24455B630e5FC711239 mandate
-genlayer call 0x2334E39DFB3b3746A412b24455B630e5FC711239 limits
+genlayer call 0xdAf45c47d23e62de5F9423939b86358F150485b9 mandate
+genlayer call 0xdAf45c47d23e62de5F9423939b86358F150485b9 limits
 ```
+
+`limits` reads back `min_confidence: 75` and `confidence_tol: 20` -- the exact
+configuration in which the rejected revision would ratify a leader confidence of
+74 and then store the spend as denied.
 
 The digest is the mandate's content address. It changes if a clause is added or
 revoked, so the value above pins the mandate this contract was deployed with --
 watch it to detect that the rules you were audited against have moved.
+
+#### Prior deployment (superseded)
+
+`0x2334E39DFB3b3746A412b24455B630e5FC711239`, deploy tx
+`0x37d21153db91acc65d8dfbc2e1796ec1b775033fa731595efade794d1943b8aa`. Kept for
+provenance only: its `validator_fn` compares the leader's raw `confidence`
+before the `min_confidence` threshold, so it carries the defect that got the
+submission rejected. **Do not treat it as current.** Its mandate digest is
+identical to the one above -- the digest content-addresses clause text, and no
+clause changed, so it does not distinguish the two and the contract address is
+what tells them apart.
 
 ## API
 
@@ -388,9 +440,15 @@ What remains unverified is the part that needs a network, not a runtime:
 
 - **consensus is simulated, not observed.** `test_contract_runtime.py` runs both
   halves of the round -- the leader function, then `validator_fn` against
-  `gl.vm.Return(leader_result)` exactly as the runner passes it -- and asserts
-  they agree. What it cannot do is run two nodes against two real model calls, so
-  leader/validator convergence on genuine model output is still unobserved.
+  `gl.vm.Return(leader_result)` exactly as the runner passes it. Its `model`
+  fixture feeds one response to both halves, which is the honest case; its
+  `split_round` fixture supplies the leader's calldata directly while
+  `exec_prompt` answers the validator's own re-run, so the two halves can be
+  driven apart on purpose. That second fixture exists because the first one
+  cannot fail: a round where both halves see the same response can never show a
+  leader/validator split, and the confidence-threshold defect above lived
+  exactly there. What neither can do is run two nodes against two real model
+  calls, so convergence on genuine model output is still unobserved.
 - **no GenVM.** Gas, the sandbox, cloudpickle serialization of the leader and
   validator closures, and greyboxing are all absent.
 - **no model.** `gl.nondet.exec_prompt` is substituted per test, so the prompt is
