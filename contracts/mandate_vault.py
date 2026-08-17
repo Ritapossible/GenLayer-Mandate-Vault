@@ -730,8 +730,22 @@ def build_review_prompt(
 # <<< END INLINE mandate_prompts.py
 
 
-def _parse_address(raw: str, field: str) -> Address:
-    """Parse caller-supplied text into an Address, failing as a user error.
+def _parse_address(raw: object, field: str) -> Address:
+    """Accept an address as either a decoded `Address` or its hex text.
+
+    Both spellings arrive in practice, and refusing the first made every
+    address-taking method unreachable from the standard tooling. GenLayer
+    calldata has a **native address type**, and `genlayer` CLI emits it by
+    default: a bare 40-hex-character argument is auto-detected and encoded as
+    `addr#...`, so the runner hands this function an `Address` object, not a
+    `str`. A `str` guard alone therefore rejected the only form the CLI
+    produces -- `request_spend` rolled back with "payee must be a string"
+    against calldata that named a perfectly good address.
+
+    That failure is invisible to a test suite that passes hex strings, which is
+    what every test did until the decoded-address cases in
+    `test_contract_runtime.py` were added. It took a live transaction to
+    surface, and the receipt named it exactly.
 
     `Address(...)` raises its own exception on malformed input. Left unguarded
     that surfaces as a runtime fault rather than a rejected transaction, which
@@ -739,8 +753,12 @@ def _parse_address(raw: str, field: str) -> Address:
     wrong". Bad input from a caller is an expected condition, so it is reported
     as one.
     """
+    if isinstance(raw, Address):
+        return raw
     if not isinstance(raw, str):
-        raise gl.vm.UserError(f"{ERROR_EXPECTED} {field} must be a string")
+        raise gl.vm.UserError(
+            f"{ERROR_EXPECTED} {field} must be an address or a hex string"
+        )
     try:
         return Address(raw)
     except Exception:
@@ -753,7 +771,11 @@ def _parse_address(raw: str, field: str) -> Address:
 # `@gl.public.write` nor `@gl.public.view` wraps the function; both only set
 # attributes on it. So an `amount: int` parameter genuinely arrives as whatever
 # the caller encoded, and calldata decodes to
-# `None | int | str | bytes | list | dict`.
+# `None | int | str | bytes | list | dict | Address`.
+#
+# `Address` belongs on that list and its absence was a real defect, not a
+# documentation slip: it is why `_parse_address` used to refuse the CLI's own
+# encoding. See that function.
 #
 # Every such value has to be refused at the boundary, before any arithmetic
 # touches it. `int("abc")` raises `ValueError` and `None < 0` raises

@@ -649,6 +649,54 @@ def test_a_truthy_non_bool_cannot_grant_authority(vault, runtime: Runtime):
         contract.request_spend(vault, PAYEE, 1_000, "should not be authorized")
 
 
+def test_the_calldata_boundary_takes_a_decoded_address(
+    vault, runtime: Runtime, no_model
+):
+    """The form the CLI actually sends, which the contract used to refuse.
+
+    GenLayer calldata has a native address type and `genlayer` CLI emits it by
+    default -- a bare 40-hex argument auto-detects and is encoded `addr#...`, so
+    the runner passes an `Address`, not a `str`. `_parse_address` guarded on
+    `isinstance(raw, str)` alone, so the first live `request_spend` rolled back
+    with `[EXPECTED] payee must be a string` against a valid address, and every
+    address-taking method was unreachable from the standard tooling.
+
+    Every other test in this suite passes hex strings, which is exactly why the
+    defect survived them. This one passes the decoded object.
+    """
+    contract = runtime.module.MandateVault
+    payee = runtime.Address(bytes(range(40, 60)))
+
+    contract.set_allowlist(vault, payee, True)
+    result = contract.request_spend(vault, payee, 5_000, "gpu hours")
+
+    assert result["outcome"] == "approved"
+    assert result["reason"] == "auto_approved_allowlist"
+
+    stored = contract.get_spend(vault, result["id"])
+    assert stored["payee"] == payee.as_hex
+
+
+def test_an_address_reaches_the_same_key_in_either_spelling(
+    vault, runtime: Runtime, no_model
+):
+    """A table written with one spelling must read back under the other.
+
+    `_listed` keys on `normalize_address(addr.as_hex)`, so a decoded `Address`
+    and its hex text have to land in the same bucket. If they did not, a payee
+    denylisted through the CLI would read as unlisted when named as a string --
+    a bypass, and the quietest possible one.
+    """
+    contract = runtime.module.MandateVault
+    blocked = runtime.Address(bytes(range(60, 80)))
+
+    contract.set_denylist(vault, blocked, True)  # written as an Address
+
+    screen = contract.simulate(vault, blocked.as_hex, 1_000)  # read as a string
+    assert screen["outcome"] == "denied"
+    assert screen["reason"] == "payee_denylisted"
+
+
 def test_a_malformed_address_is_a_rejected_transaction(vault, runtime: Runtime):
     """`Address()` raises its own exception; unguarded that is a VM fault."""
     with pytest.raises(runtime.UserError) as excinfo:

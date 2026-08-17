@@ -203,14 +203,13 @@ and turn a rounding artifact into a consensus failure.
 ### Deployed instance
 
 The command above, run against GenLayer Studio. **This is the submitted
-deployment**, and it carries the fix described under [Compare after coercion,
-never before](#compare-after-coercion-never-before):
+deployment**:
 
 | | |
 |---|---|
 | network | `studionet` -- GenLayer Studio Network, chain id `61999` |
-| contract | `0xdAf45c47d23e62de5F9423939b86358F150485b9` |
-| deploy tx | `0xf387eb19e3be2bbf1ba946122459e16828eaba217e2ed90b052b9829f9279d54` |
+| contract | `0xF0c76Be50aF06e75a1239Eccf900b0C78B712190` |
+| deploy tx | `0xb7a9becdfd7d7e8ec658b305b7a75681d56c323a224ee3d4f1d13b46d5a2c8b2` |
 | owner | `0xaA34e14a0e0B2fdD8Ad10F06bC0907fA0b1D02Bd` |
 | mandate digest | `71762c397f33980e614ba2db36440eaaafcfb9fa8b9c32eb4a9daf45d3bd044f` |
 
@@ -221,8 +220,8 @@ Deployed with the two example clauses above and the limits in the same command,
 read back and confirmed on-chain:
 
 ```bash
-genlayer call 0xdAf45c47d23e62de5F9423939b86358F150485b9 mandate
-genlayer call 0xdAf45c47d23e62de5F9423939b86358F150485b9 limits
+genlayer call 0xF0c76Be50aF06e75a1239Eccf900b0C78B712190 mandate
+genlayer call 0xF0c76Be50aF06e75a1239Eccf900b0C78B712190 limits
 ```
 
 `limits` reads back `min_confidence: 75` and `confidence_tol: 20` -- the exact
@@ -233,16 +232,40 @@ The digest is the mandate's content address. It changes if a clause is added or
 revoked, so the value above pins the mandate this contract was deployed with --
 watch it to detect that the rules you were audited against have moved.
 
-#### Prior deployment (superseded)
+#### Exercised on-chain
 
-`0x2334E39DFB3b3746A412b24455B630e5FC711239`, deploy tx
-`0x37d21153db91acc65d8dfbc2e1796ec1b775033fa731595efade794d1943b8aa`. Kept for
-provenance only: its `validator_fn` compares the leader's raw `confidence`
-before the `min_confidence` threshold, so it carries the defect that got the
-submission rejected. **Do not treat it as current.** Its mandate digest is
-identical to the one above -- the digest content-addresses clause text, and no
-clause changed, so it does not distinguish the two and the contract address is
-what tells them apart.
+Two live `request_spend` transactions against the deployment above, both
+`ACCEPTED` / `MAJORITY_AGREE` with three validators voting `AGREE`:
+
+| tx | memo | leader `eq_outputs` | stored |
+|---|---|---|---|
+| `0xba6a1120…9c6b50` (id 0) | "rent H100 GPU hours for a training run" | `{"clause_id":0,"confidence":97,"decision":"inside"}` | `approved` / `clause_match` / clause 0 |
+| `0x1850412a…647d0d` (id 1) | "gift cards for the team holiday party" | `{"clause_id":null,"confidence":0,"decision":"outside"}` | `denied` / `no_clause_match` |
+
+This is the contract's whole thesis in two transactions: identical caps,
+identical payee, and the only thing separating them is what the money is *for*.
+A cap cannot tell a GPU lease from a gift card. The mandate can.
+
+Both `eq_outputs` values are canonical -- sorted keys, clamped confidence, an
+id drawn from the mandate's own set -- which is what `canonical_leader_verdict`
+requires of the leader and what real validators independently reproduced and
+agreed with. The approval's confidence of 97 sits inside the approval bucket,
+so it is the exact path the rejected revision got wrong.
+
+Afterwards: `total_spends` 2, `spent_in_period` 50000000, `remaining_in_period`
+1950000000. The denial is recorded at full price and consumes none of the cap.
+
+#### Prior deployments (superseded)
+
+Kept for provenance only. **Do not treat either as current.** Their mandate
+digests are identical to the one above -- the digest content-addresses clause
+text, and no clause changed -- so the contract address is the only thing that
+tells them apart.
+
+| contract | why superseded |
+|---|---|
+| `0x2334E39DFB3b3746A412b24455B630e5FC711239` | `validator_fn` compares the leader's raw `confidence` before the `min_confidence` threshold: the defect that got the submission rejected. |
+| `0xdAf45c47d23e62de5F9423939b86358F150485b9` | carries the confidence fix, but `_parse_address` refuses a decoded `Address`, so every address-taking method is unreachable from the CLI. |
 
 ## API
 
@@ -438,17 +461,19 @@ constructor test's stub wires `gl.storage` to raise on any access.
 
 What remains unverified is the part that needs a network, not a runtime:
 
-- **consensus is simulated, not observed.** `test_contract_runtime.py` runs both
-  halves of the round -- the leader function, then `validator_fn` against
-  `gl.vm.Return(leader_result)` exactly as the runner passes it. Its `model`
-  fixture feeds one response to both halves, which is the honest case; its
-  `split_round` fixture supplies the leader's calldata directly while
-  `exec_prompt` answers the validator's own re-run, so the two halves can be
-  driven apart on purpose. That second fixture exists because the first one
-  cannot fail: a round where both halves see the same response can never show a
-  leader/validator split, and the confidence-threshold defect above lived
-  exactly there. What neither can do is run two nodes against two real model
-  calls, so convergence on genuine model output is still unobserved.
+- **consensus is simulated in the suite, and now also observed on-chain.**
+  `test_contract_runtime.py` runs both halves of the round -- the leader
+  function, then `validator_fn` against `gl.vm.Return(leader_result)` exactly as
+  the runner passes it. Its `model` fixture feeds one response to both halves,
+  which is the honest case; its `split_round` fixture supplies the leader's
+  calldata directly while `exec_prompt` answers the validator's own re-run, so
+  the two halves can be driven apart on purpose. That second fixture exists
+  because the first one cannot fail: a round where both halves see the same
+  response can never show a leader/validator split, and the confidence-threshold
+  defect lived exactly there. What the suite cannot do is run two nodes against
+  two real model calls -- so that was done live instead, in the two transactions
+  recorded under [Exercised on-chain](#exercised-on-chain), where independent
+  validators reproduced the leader's canonical verdict and agreed.
 - **no GenVM.** Gas, the sandbox, cloudpickle serialization of the leader and
   validator closures, and greyboxing are all absent.
 - **no model.** `gl.nondet.exec_prompt` is substituted per test, so the prompt is
@@ -476,6 +501,23 @@ the library modules rather than the artifact -- `test_contract_sync.py` now
 resolves the artifact's names statically instead.
 
 ## Design decisions
+
+**An address argument arrives decoded, not as text.** GenLayer calldata has a
+native address type, and the `genlayer` CLI emits it by default -- a bare
+40-hex-character argument auto-detects and is encoded `addr#...`. So a method
+declared `payee: str` is handed an `Address`, and `_parse_address` accepts both.
+Guarding on `isinstance(raw, str)` alone made every address-taking method
+(`request_spend`, `simulate`, `set_agent`, `set_allowlist`, `set_denylist`)
+unreachable from the standard tooling: the first live `request_spend` rolled
+back with `[EXPECTED] payee must be a string` against a perfectly valid address.
+
+Two things are worth keeping from that. The failure was **invisible to the whole
+test suite**, because every test passed a hex string -- the one input shape the
+CLI never sends; the decoded-address cases in `test_contract_runtime.py` now
+cover it. And the rollback was *correct behaviour under a wrong premise*: the
+error-class protocol did its job, the message carried `[EXPECTED]`, and all
+validators agreed on the failure rather than faulting unclassified. A contract
+can be perfectly consensus-safe and still be unusable.
 
 **Block time is parsed, not trusted to the host.** The runtime hands the block
 time over as a *string* -- calldata decodes to `None`/`int`/`str`/`bytes`/`list`/
